@@ -312,7 +312,25 @@ class BboxReader(Dataset):
 
                 bboxes = self.sample_bboxes[int(bbox[0])]
                 isScale = self.augtype['scale'] and (self.mode=='train')
-                sample, target, bboxes, coord = self.crop(imgs, bbox[1:], bboxes,isScale,is_random_crop)
+                selected_is_original_gt = False
+                if len(bboxes) > 0:
+                    selected_is_original_gt = np.any(
+                        np.all(np.isclose(np.asarray(bboxes, dtype=np.float32)[:, :6], bbox[1:7]), axis=1)
+                    )
+                allow_large_lesion_resize = (
+                    self.mode == 'train'
+                    and not is_random_crop
+                    and selected_is_original_gt
+                    and bool(self.cfg.get('large_lesion_resize', True))
+                )
+                sample, target, bboxes, coord = self.crop(
+                    imgs,
+                    bbox[1:],
+                    bboxes,
+                    isScale,
+                    is_random_crop,
+                    allow_large_lesion_resize=allow_large_lesion_resize,
+                )
                 if self.mode == 'train' and not is_random_crop:
                      sample, target, bboxes = augment(sample, target, bboxes, do_flip = self.augtype['flip'],
                                                              do_rotate=self.augtype['rotate'], do_swap = self.augtype['swap'],
@@ -698,10 +716,113 @@ class Crop(object):
         target = np.array([np.nan, np.nan, np.nan, np.nan, np.nan, np.nan], dtype=np.float32)
         return crop, target, bboxes, coord
 
-    def __call__(self, imgs, target, bboxes,isScale=False,isRand=False):
+    def _make_coord(self, start, crop_size, image_shape):
+        normstart = np.asarray(start, dtype=np.float32) / np.asarray(image_shape, dtype=np.float32) - 0.5
+        normsize = np.asarray(crop_size, dtype=np.float32) / np.asarray(image_shape, dtype=np.float32)
+        xx, yy, zz = np.meshgrid(
+            np.linspace(normstart[0], normstart[0] + normsize[0], int(self.crop_size[0] / self.stride)),
+            np.linspace(normstart[1], normstart[1] + normsize[1], int(self.crop_size[1] / self.stride)),
+            np.linspace(normstart[2], normstart[2] + normsize[2], int(self.crop_size[2] / self.stride)),
+            indexing='ij',
+        )
+        return np.concatenate([xx[np.newaxis, ...], yy[np.newaxis, ...], zz[np.newaxis, :]], 0).astype('float32')
+
+    def _fit_crop_start(self, target, crop_size, image_shape):
+        start = []
+        for axis, box_axis in enumerate([0, 2, 4]):
+            crop_len = int(crop_size[axis])
+            image_len = int(image_shape[axis])
+            target_min = float(target[box_axis])
+            target_max = float(target[box_axis + 1])
+            center = (target_min + target_max) / 2.0
+            axis_start = int(math.floor(center - (crop_len - 1) / 2.0))
+            if axis_start > target_min:
+                axis_start = int(math.floor(target_min))
+            if axis_start + crop_len - 1 < target_max:
+                axis_start = int(math.ceil(target_max - crop_len + 1))
+            if crop_len <= image_len:
+                axis_start = min(max(axis_start, 0), image_len - crop_len)
+            start.append(axis_start)
+        return np.asarray(start, dtype=np.int32)
+
+    def _crop_with_padding(self, imgs, start, crop_size):
+        pad = [[0, 0]]
+        slices = []
+        for axis in range(3):
+            axis_start = int(start[axis])
+            crop_len = int(crop_size[axis])
+            image_len = int(imgs.shape[axis + 1])
+            leftpad = max(0, -axis_start)
+            rightpad = max(0, axis_start + crop_len - image_len)
+            pad.append([leftpad, rightpad])
+            slices.append(slice(max(axis_start, 0), min(axis_start + crop_len, image_len)))
+        crop = imgs[:, slices[0], slices[1], slices[2]]
+        return np.pad(crop, pad, 'constant', constant_values=self.pad_value)
+
+    def _resize_to_crop_size(self, crop, source_crop_size):
+        output_size = np.asarray(self.crop_size, dtype=np.int32)
+        source_crop_size = np.asarray(source_crop_size, dtype=np.float32)
+        resize_scale = output_size.astype(np.float32) / source_crop_size
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            crop = zoom(crop, [1, resize_scale[0], resize_scale[1], resize_scale[2]], order=1)
+        pad = [[0, 0]]
+        slices = [slice(None)]
+        for axis in range(3):
+            out_len = int(output_size[axis])
+            cur_len = int(crop.shape[axis + 1])
+            if cur_len >= out_len:
+                slices.append(slice(0, out_len))
+                pad.append([0, 0])
+            else:
+                slices.append(slice(0, cur_len))
+                pad.append([0, out_len - cur_len])
+        crop = crop[tuple(slices)]
+        if any(p[1] > 0 for p in pad[1:]):
+            crop = np.pad(crop, pad, 'constant', constant_values=self.pad_value)
+        return crop, resize_scale
+
+    def _large_lesion_resize_crop(self, imgs, target, bboxes):
+        target = np.copy(np.asarray(target, dtype=np.float32))
+        bboxes = np.copy(np.asarray(bboxes, dtype=np.float32))
+        crop_size = np.asarray(self.crop_size, dtype=np.float32)
+        target_size = target[[1, 3, 5]] - target[[0, 2, 4]] + 1.0
+        scale = min(1.0, float(np.min(crop_size / target_size)))
+        source_crop_size = np.ceil(crop_size / scale).astype(np.int32)
+        source_crop_size = np.maximum(source_crop_size, 1)
+
+        start = self._fit_crop_start(target, source_crop_size, imgs.shape[1:])
+        coord = self._make_coord(start, source_crop_size, imgs.shape[1:])
+        crop = self._crop_with_padding(imgs, start, source_crop_size)
+        source_shape = np.asarray(crop.shape[1:], dtype=np.float32)
+        crop, resize_scale = self._resize_to_crop_size(crop, source_shape)
+
+        for axis, box_axis in enumerate([0, 2, 4]):
+            target_min = target[box_axis] - start[axis]
+            target_max_exclusive = target[box_axis + 1] - start[axis] + 1.0
+            target[box_axis] = target_min * resize_scale[axis]
+            target[box_axis + 1] = target_max_exclusive * resize_scale[axis] - 1.0
+            for box_idx in range(len(bboxes)):
+                box_min = bboxes[box_idx][box_axis] - start[axis]
+                box_max_exclusive = bboxes[box_idx][box_axis + 1] - start[axis] + 1.0
+                bboxes[box_idx][box_axis] = box_min * resize_scale[axis]
+                bboxes[box_idx][box_axis + 1] = box_max_exclusive * resize_scale[axis] - 1.0
+
+        return crop.astype(imgs.dtype, copy=False), target, bboxes, coord
+
+    def __call__(self, imgs, target, bboxes, isScale=False, isRand=False, allow_large_lesion_resize=False):
         target = np.asarray(target, dtype=np.float32)
         if isRand:
             isScale = False
+        crop_size_cfg = np.asarray(self.crop_size, dtype=np.float32)
+        target_size = target[[1, 3, 5]] - target[[0, 2, 4]] + 1.0 if len(target) >= 6 else np.zeros((3,), dtype=np.float32)
+        if (
+            allow_large_lesion_resize
+            and np.isfinite(target_size).all()
+            and np.any(target_size > crop_size_cfg)
+        ):
+            return self._large_lesion_resize_crop(imgs, target, bboxes)
+
         if isScale:
             radiusLim = [8.,120.]
             scaleLim = [0.75,1.25]

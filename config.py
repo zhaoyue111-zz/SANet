@@ -26,6 +26,7 @@ data_config = {
 
     'roi_names': ['nodule'],
     'crop_size': [128, 128, 128],  # 训练时裁剪的 3D patch 大小
+    'large_lesion_resize': True,  # 仅当当前正样本GT任一轴超过crop_size时，扩大视野后缩回crop_size
     'bbox_border': 8,  # 给标注框额外扩大的边界
     'partial_gt_positive_threshold': 0.5,
     'pad_value': 170,  # 裁剪越界时填充值
