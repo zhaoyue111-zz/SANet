@@ -341,6 +341,39 @@ def optimizer_to_device(optimizer, device):
                 state[key] = value.to(device)
 
 
+def clear_model_batch_state(model):
+    attrs = [
+        'rpn_proposals',
+        'raw_rpn_proposals',
+        'detections',
+        'ensemble_proposals',
+        'rpn_labels',
+        'rpn_label_assigns',
+        'rpn_label_weights',
+        'rpn_targets',
+        'rpn_target_weights',
+        'rpn_window',
+        'rpn_logits_flat',
+        'rpn_deltas_flat',
+        'rcnn_proposals',
+        'rcnn_labels',
+        'rcnn_assigns',
+        'rcnn_targets',
+        'rcnn_logits',
+        'rcnn_deltas',
+        'keeps',
+        'mask_probs',
+        'total_loss',
+        'rpn_cls_loss',
+        'rpn_reg_loss',
+        'rcnn_cls_loss',
+        'rcnn_reg_loss',
+    ]
+    for attr in attrs:
+        if hasattr(model, attr):
+            delattr(model, attr)
+
+
 def checkpoint_update_flags(epoch, epoch_rcnn, val_froc_mean, best_froc_mean, best_rcnn_froc_mean):
     is_best = val_froc_mean > best_froc_mean
     is_rcnn_epoch = epoch >= epoch_rcnn
@@ -633,15 +666,8 @@ def train(net, train_loader, optimizer, epoch, writer, args):
         rpn_stats.append(to_numpy_safe(rpn_stat))
         rcnn_stats.append(to_numpy_safe(rcnn_stat))
 
-        del input, truth_box, truth_label
-        del model.rpn_proposals, model.detections
-        if hasattr(model, 'raw_rpn_proposals'):
-            del model.raw_rpn_proposals
-        del model.total_loss, model.rpn_cls_loss, model.rpn_reg_loss, model.rcnn_cls_loss, model.rcnn_reg_loss
-        del model.rpn_logits_flat, model.rpn_deltas_flat
-
-        if model.use_rcnn:
-            del model.rcnn_logits, model.rcnn_deltas
+        del input, truth_box, truth_label, loss, rpn_stat, rcnn_stat
+        clear_model_batch_state(model)
 
     rpn_stats = np.asarray(rpn_stats, np.float32)
 
@@ -742,6 +768,8 @@ def validate(net, val_loader, epoch, writer, args):
         total_loss.append(loss.cpu().data.item())
         rpn_stats.append(to_numpy_safe(rpn_stat))
         rcnn_stats.append(to_numpy_safe(rcnn_stat))
+        del input, truth_box, truth_label, loss, rpn_stat, rcnn_stat, raw_proposals, detections
+        clear_model_batch_state(model)
 
     rpn_stats = np.asarray(rpn_stats, np.float32)
     print('Val Epoch %d, iter %d, total time %f, loss %f' % (epoch, j, time.time() - s, np.average(total_loss)))
@@ -853,15 +881,6 @@ def validate(net, val_loader, epoch, writer, args):
         writer.add_scalar('rcnn_reg_d', np.mean(rcnn_stats[:, 3]), epoch)
         writer.add_scalar('rcnn_reg_h', np.mean(rcnn_stats[:, 4]), epoch)
         writer.add_scalar('rcnn_reg_w', np.mean(rcnn_stats[:, 5]), epoch)
-
-    del input, truth_box, truth_label
-    del model.rpn_proposals, model.detections
-    if hasattr(model, 'raw_rpn_proposals'):
-        del model.raw_rpn_proposals
-    del model.total_loss, model.rpn_cls_loss, model.rpn_reg_loss, model.rcnn_cls_loss, model.rcnn_reg_loss
-
-    if model.use_rcnn:
-        del model.rcnn_logits, model.rcnn_deltas
 
     torch.cuda.empty_cache()
     return {
