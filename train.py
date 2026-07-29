@@ -184,6 +184,32 @@ def summarize_detection_meter(meter):
     return summary
 
 
+def merge_detection_meters(meters):
+    merged = init_detection_meter()
+    merged['num_scans'] = 0
+    merged['num_gt'] = 0
+    merged['num_candidates'] = 0
+    for meter in meters:
+        merged['num_scans'] += meter['num_scans']
+        merged['num_gt'] += meter['num_gt']
+        merged['num_candidates'] += meter['num_candidates']
+        merged['scores'].extend(meter['scores'])
+        merged['is_tp'].extend(meter['is_tp'])
+        merged['best_score_per_gt'].extend(meter['best_score_per_gt'])
+        for threshold in VAL_SCORE_THRESHOLDS:
+            for key in ['tp', 'fp', 'fn']:
+                merged['score_thresholds'][threshold][key] += meter['score_thresholds'][threshold][key]
+    return merged
+
+
+def distributed_merge_detection_meter(meter, args):
+    if not getattr(args, 'distributed', False):
+        return meter
+    gathered = [None for _ in range(args.world_size)]
+    dist.all_gather_object(gathered, meter)
+    return merge_detection_meters(gathered)
+
+
 parser = argparse.ArgumentParser(description='PyTorch Detector')
 parser.add_argument('--net', '-m', metavar='NET', default=train_config['net'],
                     help='neural net')
@@ -307,6 +333,15 @@ def optimizer_to_device(optimizer, device):
                 state[key] = value.to(device)
 
 
+def checkpoint_update_flags(epoch, epoch_rcnn, val_froc_mean, best_froc_mean, best_rcnn_froc_mean):
+    is_best = val_froc_mean > best_froc_mean
+    is_rcnn_epoch = epoch >= epoch_rcnn
+    is_best_rcnn = is_rcnn_epoch and val_froc_mean > best_rcnn_froc_mean
+    next_best_froc_mean = val_froc_mean if is_best else best_froc_mean
+    next_best_rcnn_froc_mean = val_froc_mean if is_best_rcnn else best_rcnn_froc_mean
+    return is_best, is_best_rcnn, next_best_froc_mean, next_best_rcnn_froc_mean
+
+
 def build_split_dataset(dataset_name, split, hard_fp_csv=None, hard_fn_csv=None,
                         hard_fp_threshold=0.9, train_neg_pos_ratio=1.0):
     cfgs = dataset_configs(dataset_name, skip_missing=(dataset_name == 'all'))
@@ -405,6 +440,8 @@ def main():
 
     start_epoch = 0
     best_loss = np.inf
+    best_froc_mean = -np.inf
+    best_rcnn_froc_mean = -np.inf
     optimizer_state = None
 
     if initial_checkpoint:
@@ -424,6 +461,8 @@ def main():
         if args.resume:
             start_epoch = checkpoint.get('epoch', 0)
             best_loss = checkpoint.get('best_loss', np.inf)
+            best_froc_mean = checkpoint.get('best_froc_mean', -np.inf)
+            best_rcnn_froc_mean = checkpoint.get('best_rcnn_froc_mean', -np.inf)
             optimizer_state = checkpoint.get('optimizer')
 
         state = net.state_dict()
@@ -499,8 +538,9 @@ def main():
 
         print('[epoch %d, lr %f, use_rcnn: %r]' % (i, lr, model.use_rcnn))
         train(net, train_loader, optimizer, i, train_writer, args)
-        val_loss = validate(net, val_loader, i, val_writer, args)
-        val_loss = distributed_mean(val_loss, args)
+        val_summary = validate(net, val_loader, i, val_writer, args)
+        val_loss = distributed_mean(val_summary['loss'], args)
+        val_froc_mean = distributed_mean(val_summary['froc_mean'], args)
 
         if not is_main_process(args):
             if args.distributed:
@@ -511,9 +551,15 @@ def main():
         for key in state_dict.keys():
             state_dict[key] = state_dict[key].cpu()
 
-        is_best = val_loss < best_loss
-        if is_best:
+        if val_loss < best_loss:
             best_loss = val_loss
+        is_best, is_best_rcnn, best_froc_mean, best_rcnn_froc_mean = checkpoint_update_flags(
+            i,
+            epoch_rcnn,
+            val_froc_mean,
+            best_froc_mean,
+            best_rcnn_froc_mean,
+        )
 
         checkpoint = {
             'epoch': i,
@@ -521,7 +567,12 @@ def main():
             'state_dict': state_dict,
             'optimizer': optimizer.state_dict(),
             'best_loss': best_loss,
+            'best_froc_mean': best_froc_mean,
+            'best_rcnn_froc_mean': best_rcnn_froc_mean,
             'val_loss': val_loss,
+            'val_froc_mean': val_froc_mean,
+            'val_det_summary': val_summary['det'],
+            'val_rpn_det_summary': val_summary['rpn_det'],
         }
         # if i % epoch_save == 0:
         #     torch.save(checkpoint, os.path.join(model_out_dir, '%03d.ckpt' % i))
@@ -529,7 +580,12 @@ def main():
         torch.save(checkpoint, os.path.join(model_out_dir, 'final.ckpt'))
         if is_best:
             torch.save(checkpoint, os.path.join(model_out_dir, 'best.ckpt'))
-            print('[best checkpoint updated: epoch %d, val_loss %.6f]' % (i, val_loss))
+            print('[best checkpoint updated: epoch %d, val_froc_mean %.6f, val_loss %.6f]' % (
+                i, val_froc_mean, val_loss))
+        if is_best_rcnn:
+            torch.save(checkpoint, os.path.join(model_out_dir, 'best_rcnn.ckpt'))
+            print('[best RCNN checkpoint updated: epoch %d, val_froc_mean %.6f, val_loss %.6f]' % (
+                i, val_froc_mean, val_loss))
         if args.distributed:
             dist.barrier()
 
@@ -644,6 +700,7 @@ def validate(net, val_loader, epoch, writer, args):
     total_loss = []
     rpn_stats = []
     rcnn_stats = []
+    rpn_detection_meter = init_detection_meter()
     detection_meter = init_detection_meter()
 
     s = time.time()
@@ -656,10 +713,16 @@ def validate(net, val_loader, epoch, writer, args):
             loss, rpn_stat, rcnn_stat = model.loss()
             raw_proposals = getattr(model, 'raw_rpn_proposals', model.rpn_proposals)
             raw_proposals = raw_proposals.detach().cpu().numpy() if torch.is_tensor(raw_proposals) else np.empty((0, 8), dtype=np.float32)
+            detections = model.detections.detach().cpu().numpy() if torch.is_tensor(model.detections) else np.empty((0, 8), dtype=np.float32)
             for b in range(len(truth_box)):
                 update_detection_meter(
-                    detection_meter,
+                    rpn_detection_meter,
                     raw_proposals[raw_proposals[:, 0] == b] if len(raw_proposals) else np.empty((0, 8), dtype=np.float32),
+                    truth_box[b],
+                )
+                update_detection_meter(
+                    detection_meter,
+                    detections[detections[:, 0] == b] if len(detections) else np.empty((0, 8), dtype=np.float32),
                     truth_box[b],
                 )
 
@@ -689,8 +752,31 @@ def validate(net, val_loader, epoch, writer, args):
         np.mean(rpn_stats[:, 7]),
         np.mean(rpn_stats[:, 8]),
         np.mean(rpn_stats[:, 9])))
+    rpn_detection_meter = distributed_merge_detection_meter(rpn_detection_meter, args)
+    detection_meter = distributed_merge_detection_meter(detection_meter, args)
+    rpn_det_summary = summarize_detection_meter(rpn_detection_meter)
     det_summary = summarize_detection_meter(detection_meter)
     print('val_rpn_det: scans %d, gt %d, candidates %d, cand/scan %.4f, FROC_mean %.6f, gt_detected_any %.6f' % (
+        rpn_det_summary['num_scans'],
+        rpn_det_summary['num_gt'],
+        rpn_det_summary['num_candidates'],
+        rpn_det_summary['candidates_per_scan'],
+        rpn_det_summary['froc_mean'],
+        rpn_det_summary.get('gt_detected_any_score', 0.0),
+    ))
+    for threshold in VAL_SCORE_THRESHOLDS:
+        print('val_rpn_det@%.2f: TP %d, FP %d, FN %d, sens %.6f, fp/scan %.6f' % (
+            threshold,
+            rpn_det_summary['tp@%.2f' % threshold],
+            rpn_det_summary['fp@%.2f' % threshold],
+            rpn_det_summary['fn@%.2f' % threshold],
+            rpn_det_summary['sensitivity@%.2f' % threshold],
+            rpn_det_summary['fp_per_scan@%.2f' % threshold],
+        ))
+    print('val_rpn_froc: ' + ', '.join(
+        ['%.3gfp=%.6f' % (fp, rpn_det_summary['froc_sens@%.3g' % fp]) for fp in VAL_FROC_THRESHOLDS]
+    ))
+    print('val_det: scans %d, gt %d, candidates %d, cand/scan %.4f, FROC_mean %.6f, gt_detected_any %.6f' % (
         det_summary['num_scans'],
         det_summary['num_gt'],
         det_summary['num_candidates'],
@@ -699,7 +785,7 @@ def validate(net, val_loader, epoch, writer, args):
         det_summary.get('gt_detected_any_score', 0.0),
     ))
     for threshold in VAL_SCORE_THRESHOLDS:
-        print('val_rpn_det@%.2f: TP %d, FP %d, FN %d, sens %.6f, fp/scan %.6f' % (
+        print('val_det@%.2f: TP %d, FP %d, FN %d, sens %.6f, fp/scan %.6f' % (
             threshold,
             det_summary['tp@%.2f' % threshold],
             det_summary['fp@%.2f' % threshold],
@@ -707,7 +793,7 @@ def validate(net, val_loader, epoch, writer, args):
             det_summary['sensitivity@%.2f' % threshold],
             det_summary['fp_per_scan@%.2f' % threshold],
         ))
-    print('val_rpn_froc: ' + ', '.join(
+    print('val_det_froc: ' + ', '.join(
         ['%.3gfp=%.6f' % (fp, det_summary['froc_sens@%.3g' % fp]) for fp in VAL_FROC_THRESHOLDS]
     ))
 
@@ -725,14 +811,20 @@ def validate(net, val_loader, epoch, writer, args):
     writer.add_scalar('rpn_reg_d', np.mean(rpn_stats[:, 7]), epoch)
     writer.add_scalar('rpn_reg_h', np.mean(rpn_stats[:, 8]), epoch)
     writer.add_scalar('rpn_reg_w', np.mean(rpn_stats[:, 9]), epoch)
-    writer.add_scalar('det/rpn_candidates_per_scan', det_summary['candidates_per_scan'], epoch)
-    writer.add_scalar('det/rpn_froc_mean', det_summary['froc_mean'], epoch)
-    writer.add_scalar('det/rpn_gt_detected_any_score', det_summary.get('gt_detected_any_score', 0.0), epoch)
+    writer.add_scalar('det/rpn_candidates_per_scan', rpn_det_summary['candidates_per_scan'], epoch)
+    writer.add_scalar('det/rpn_froc_mean', rpn_det_summary['froc_mean'], epoch)
+    writer.add_scalar('det/rpn_gt_detected_any_score', rpn_det_summary.get('gt_detected_any_score', 0.0), epoch)
+    writer.add_scalar('det/candidates_per_scan', det_summary['candidates_per_scan'], epoch)
+    writer.add_scalar('det/froc_mean', det_summary['froc_mean'], epoch)
+    writer.add_scalar('det/gt_detected_any_score', det_summary.get('gt_detected_any_score', 0.0), epoch)
     for threshold in VAL_SCORE_THRESHOLDS:
-        writer.add_scalar('det/rpn_sensitivity@%.2f' % threshold, det_summary['sensitivity@%.2f' % threshold], epoch)
-        writer.add_scalar('det/rpn_fp_per_scan@%.2f' % threshold, det_summary['fp_per_scan@%.2f' % threshold], epoch)
+        writer.add_scalar('det/rpn_sensitivity@%.2f' % threshold, rpn_det_summary['sensitivity@%.2f' % threshold], epoch)
+        writer.add_scalar('det/rpn_fp_per_scan@%.2f' % threshold, rpn_det_summary['fp_per_scan@%.2f' % threshold], epoch)
+        writer.add_scalar('det/sensitivity@%.2f' % threshold, det_summary['sensitivity@%.2f' % threshold], epoch)
+        writer.add_scalar('det/fp_per_scan@%.2f' % threshold, det_summary['fp_per_scan@%.2f' % threshold], epoch)
     for fp in VAL_FROC_THRESHOLDS:
-        writer.add_scalar('det/rpn_froc_sens@%.3gfp' % fp, det_summary['froc_sens@%.3g' % fp], epoch)
+        writer.add_scalar('det/rpn_froc_sens@%.3gfp' % fp, rpn_det_summary['froc_sens@%.3g' % fp], epoch)
+        writer.add_scalar('det/froc_sens@%.3gfp' % fp, det_summary['froc_sens@%.3g' % fp], epoch)
 
     if model.use_rcnn:
         confusion_matrix = np.asarray([stat[-1] for stat in rcnn_stats], np.int32)
@@ -764,7 +856,12 @@ def validate(net, val_loader, epoch, writer, args):
         del model.rcnn_logits, model.rcnn_deltas
 
     torch.cuda.empty_cache()
-    return val_loss
+    return {
+        'loss': val_loss,
+        'froc_mean': det_summary['froc_mean'],
+        'det': det_summary,
+        'rpn_det': rpn_det_summary,
+    }
 
 
 def print_confusion_matrix(confusion_matrix):

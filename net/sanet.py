@@ -392,7 +392,7 @@ class SANet(nn.Module):
         self.rpn_window = make_rpn_windows(fs, self.cfg)
         self.rpn_proposals = []
         self.raw_rpn_proposals = []
-        if self.use_rcnn or self.mode in ['eval', 'test']:
+        if self.use_rcnn or self.mode in ['valid', 'eval', 'test']:
             self.rpn_proposals = rpn_nms(self.cfg, self.mode, inputs, self.rpn_window,
                   self.rpn_logits_flat, self.rpn_deltas_flat)
             self.raw_rpn_proposals = copy.deepcopy(self.rpn_proposals)
