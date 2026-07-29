@@ -1,3 +1,5 @@
+import numpy as np
+import torch
 try:
     from utils.pybox import *
 except ImportError:
@@ -13,6 +15,94 @@ def _overlap_to_numpy(overlap):
     if hasattr(overlap, 'detach'):
         return overlap.detach().cpu().numpy()
     return overlap
+
+
+def assign_rpn_anchors(cfg, window, truth_box, truth_label):
+    """
+    Assign RPN anchors to valid GT boxes.
+
+    Positive GTs have truth_label > 0. Ignore GTs have truth_label < 0 and only
+    suppress anchors that were not already assigned to a positive GT.
+    """
+    num_window = len(window)
+    label = np.zeros((num_window, ), np.float32)
+    label_assign = np.zeros((num_window, ), np.int32) - 1
+    label_weight = np.zeros((num_window, ), np.float32)
+    target_weight = np.zeros((num_window, ), np.float32)
+
+    truth_box = np.asarray(truth_box, dtype=np.float32).reshape(-1, 6)
+    truth_label = np.asarray(truth_label, dtype=np.int64).reshape(-1)
+    pos_index = np.where(truth_label > 0)[0]
+    ignore_index = np.where(truth_label < 0)[0]
+    pos_truth_box = truth_box[pos_index]
+    ignore_truth_box = truth_box[ignore_index]
+
+    num_truth_box = len(pos_truth_box)
+    if num_truth_box:
+        overlap = _overlap_to_numpy(torch_overlap(window, pos_truth_box))
+
+        anchor_best_gt = np.argmax(overlap, 1)
+        anchor_best_iou = overlap[np.arange(num_window), anchor_best_gt]
+
+        bg_index = np.where(anchor_best_iou < cfg['rpn_train_bg_thresh_high'])[0]
+        label[bg_index] = 0
+        label_weight[bg_index] = 1
+
+        fg_index = np.where(anchor_best_iou >= cfg['rpn_train_fg_thresh_low'])[0]
+        label[fg_index] = 1
+        label_weight[fg_index] = 1
+        label_assign[fg_index] = anchor_best_gt[fg_index]
+
+        gt_has_anchor = np.zeros((num_truth_box, ), np.bool_)
+        assigned_fg = fg_index[label_assign[fg_index] >= 0]
+        if len(assigned_fg):
+            gt_has_anchor[np.unique(label_assign[assigned_fg])] = True
+
+        gt_best_iou = overlap.max(axis=0)
+        for gt_idx in range(num_truth_box):
+            gt_best_anchor = np.where(overlap[:, gt_idx] == gt_best_iou[gt_idx])[0]
+            label[gt_best_anchor] = 1
+            label_weight[gt_best_anchor] = 1
+            assign_to_gt = anchor_best_gt[gt_best_anchor] == gt_idx
+            label_assign[gt_best_anchor[assign_to_gt]] = gt_idx
+            other_best = gt_best_anchor[~assign_to_gt]
+            if len(other_best):
+                label_assign[other_best] = anchor_best_gt[other_best]
+
+        assigned_fg = np.where((label != 0) & (label_assign >= 0))[0]
+        if len(assigned_fg):
+            gt_has_anchor[np.unique(label_assign[assigned_fg])] = True
+
+        for gt_idx in np.where(~gt_has_anchor)[0]:
+            own_best = np.where(anchor_best_gt == gt_idx)[0]
+            own_best = own_best[label[own_best] == 0]
+            if len(own_best):
+                order = np.lexsort((own_best, -overlap[own_best, gt_idx]))
+                anchor = own_best[order[0]]
+            else:
+                unused = np.where(label == 0)[0]
+                if not len(unused):
+                    continue
+                order = np.lexsort((unused, -overlap[unused, gt_idx]))
+                anchor = unused[order[0]]
+            label[anchor] = 1
+            label_weight[anchor] = 1
+            label_assign[anchor] = gt_idx
+
+        fg_index = np.where((label != 0) & (label_assign < 0))[0]
+        if len(fg_index):
+            label_assign[fg_index] = anchor_best_gt[fg_index]
+
+    if not num_truth_box:
+        label_weight[...] = 1
+
+    if len(ignore_truth_box):
+        ignore_overlap = _overlap_to_numpy(torch_overlap(window, ignore_truth_box))
+        ignore_anchor_index = np.where((ignore_overlap.max(axis=1) > 0) & (label == 0))[0]
+        label_weight[ignore_anchor_index] = 0
+        target_weight[ignore_anchor_index] = 0
+
+    return label, label_assign, label_weight, target_weight, pos_truth_box
 
 '''
  给 anchor 分配正负标签和 bbox 回归目标
@@ -39,87 +129,22 @@ def make_one_rpn_target(cfg, mode, input, window, truth_box, truth_label):
 
     num_neg = cfg['num_neg']
     num_window = len(window)
-    label = np.zeros((num_window, ), np.float32)
-    label_assign = np.zeros((num_window, ), np.int32) - 1
-    label_weight = np.zeros((num_window, ), np.float32)
     target = np.zeros((num_window, 6), np.float32)
-    target_weight = np.zeros((num_window, ), np.float32)
 
 
     truth_box = np.asarray(truth_box, dtype=np.float32).reshape(-1, 6)
     truth_label = np.asarray(truth_label, dtype=np.int64).reshape(-1)
-    pos_index = np.where(truth_label > 0)[0]
-    ignore_index = np.where(truth_label < 0)[0]
-    pos_truth_box = truth_box[pos_index]
-    ignore_truth_box = truth_box[ignore_index]
+    label, label_assign, label_weight, target_weight, pos_truth_box = \
+        assign_rpn_anchors(cfg, window, truth_box, truth_label)
 
     num_truth_box = len(pos_truth_box)
     if num_truth_box:
-
-        _, depth, height, width = input.size()
-
-        # Get sure background anchor boxes
-        overlap = _overlap_to_numpy(torch_overlap(window, pos_truth_box))
-
-        # For each anchor box, get the index of the ground truth box that
-        # has the largest IoU with it
-        argmax_overlap = np.argmax(overlap, 1)
-
-        # For each anchor box, get the IoU of the ground truth box that
-        # has the largest IoU with it
-        max_overlap = overlap[np.arange(num_window), argmax_overlap]
-
-        # The anchor box is a sure background, if its largest IoU is less than
-        # a threshold
-        bg_index = np.where(max_overlap < cfg['rpn_train_bg_thresh_high'])[0]
-        label[bg_index] = 0
-        label_weight[bg_index] = 1
-
-        # The anchor box is a sure foreground, if its largest IoU is larger or 
-        # equal than a threshold
-        fg_index = np.where(max_overlap >= cfg['rpn_train_fg_thresh_low'])[0]
-        label[fg_index] = 1
-        label_weight[fg_index] = 1
-        label_assign[...] = argmax_overlap
-
-        # In case no anchor box that overlaps with the ground truth box meets the threshold, 
-        # for each ground truth box, we include anchor box that has the highest IoU with it, 
-        # include multiple maxs if there exists more than one anchor box
-        argmax_overlap = np.argmax(overlap,0)
-        max_overlap = overlap[argmax_overlap,np.arange(num_truth_box)]
-        argmax_overlap, a = np.where(overlap == max_overlap)
-
-        fg_index = argmax_overlap
-
-        label[fg_index] = 1
-        label_weight[fg_index] = 1
-        label_assign[fg_index] = a
-
-        # In case one ground truth box within one batch has way too many positive anchors, 
-        # which may affect the sample in the loss fucntion,
-        # we only random one positive anchor for each ground truth box
-        # 每个GT只保留 1 个正样本
-        fg_index = np.where(label != 0)[0]
-        idx = random.sample(range(len(fg_index)), 1)
-        label[fg_index] = 0
-        label_weight[fg_index] = 0
-        fg_index = fg_index[idx]
-        label[fg_index] = 1
-        label_weight[fg_index] = 1
-
-
         # Prepare regression terms for each positive anchor
         fg_index = np.where(label != 0)[0]
         target_window = window[fg_index]
         target_truth_box = pos_truth_box[label_assign[fg_index]]
         target[fg_index] = rpn_encode(target_window, target_truth_box, cfg['box_reg_weight'])
         target_weight[fg_index] = 1
-
-        if len(ignore_truth_box):
-            ignore_overlap = _overlap_to_numpy(torch_overlap(window, ignore_truth_box))
-            ignore_anchor_index = np.where(ignore_overlap.max(axis=1) > 0)[0]
-            label_weight[ignore_anchor_index] = 0
-            target_weight[ignore_anchor_index] = 0
 
         if mode in ['train']:
             fg_index = np.where( (label_weight!=0) & (label!=0))[0]
@@ -140,14 +165,10 @@ def make_one_rpn_target(cfg, mode, input, window, truth_box, truth_label):
             if num_bg > 0:
                 label_weight[bg_index] = float(num_fg) / num_bg
 
+        fg_index = np.where(label != 0)[0]
         target_weight[fg_index] = label_weight[fg_index]
     else:
         # if there is no ground truth box in this batch
-        label_weight[...] = 1
-        if len(ignore_truth_box):
-            ignore_overlap = _overlap_to_numpy(torch_overlap(window, ignore_truth_box))
-            ignore_anchor_index = np.where(ignore_overlap.max(axis=1) > 0)[0]
-            label_weight[ignore_anchor_index] = 0
 
         if mode in ['train']:
             bg_index = np.where((label_weight!=0) & (label==0))[0]
