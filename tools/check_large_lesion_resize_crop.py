@@ -97,6 +97,29 @@ def check_large_lesion_multi_axis_resize():
         raise AssertionError("multi-axis large target should remain positive, got %s" % patch_truth)
 
 
+def check_hard_fn_like_large_target_can_resize_without_being_truth():
+    image = np.zeros((1, 180, 120, 120), dtype=np.float32)
+    hard_fn_target = np.asarray([39, 121, 19, 42, 19, 42], dtype=np.float32)
+    original_gt = np.asarray([[40, 119, 20, 39, 20, 39]], dtype=np.float32)
+    cropper = Crop(CFG)
+
+    sample, _, patch_boxes, _ = cropper(
+        image,
+        hard_fn_target,
+        original_gt,
+        isScale=False,
+        isRand=False,
+        allow_large_lesion_resize=True,
+    )
+    if sample.shape[1:] != tuple(CFG["crop_size"]):
+        raise AssertionError("hard-FN-like large crop shape mismatch: %s" % (sample.shape,))
+    patch_truth = build_patch_truth_boxes(patch_boxes, CFG["crop_size"], 0.5)
+    if patch_truth.shape != (1, 7) or int(patch_truth[0, -1]) != 1:
+        raise AssertionError("original GT should provide positive supervision for hard-FN crop, got %s" % patch_truth)
+    if np.any(np.all(np.isclose(patch_truth[:, :6], hard_fn_target), axis=1)):
+        raise AssertionError("hard-FN target box itself should not be inserted as truth")
+
+
 def check_large_lesion_boundary_padding():
     image = np.zeros((1, 100, 80, 80), dtype=np.float32)
     target = np.asarray([0, 79, 2, 31, 2, 31], dtype=np.float32)
@@ -160,6 +183,7 @@ def main():
     check_normal_lesion_does_not_trigger_resize()
     check_large_lesion_single_axis_resize()
     check_large_lesion_multi_axis_resize()
+    check_hard_fn_like_large_target_can_resize_without_being_truth()
     check_large_lesion_boundary_padding()
     check_other_gt_visible_rules_and_no_original_mutation()
     print("ok: large-lesion resize crop checks passed")

@@ -312,15 +312,9 @@ class BboxReader(Dataset):
 
                 bboxes = self.sample_bboxes[int(bbox[0])]
                 isScale = self.augtype['scale'] and (self.mode=='train')
-                selected_is_original_gt = False
-                if len(bboxes) > 0:
-                    selected_is_original_gt = np.any(
-                        np.all(np.isclose(np.asarray(bboxes, dtype=np.float32)[:, :6], bbox[1:7]), axis=1)
-                    )
                 allow_large_lesion_resize = (
                     self.mode == 'train'
                     and not is_random_crop
-                    and selected_is_original_gt
                     and bool(self.cfg.get('large_lesion_resize', True))
                 )
                 sample, target, bboxes, coord = self.crop(
@@ -765,7 +759,15 @@ class Crop(object):
         resize_scale = output_size.astype(np.float32) / source_crop_size
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            crop = zoom(crop, [1, resize_scale[0], resize_scale[1], resize_scale[2]], order=1)
+            crop = zoom(
+                crop,
+                [1, resize_scale[0], resize_scale[1], resize_scale[2]],
+                order=1,
+                mode='grid-constant',
+                cval=float(self.pad_value),
+                prefilter=False,
+                grid_mode=True,
+            )
         pad = [[0, 0]]
         slices = [slice(None)]
         for axis in range(3):
