@@ -86,8 +86,10 @@ def init_detection_meter():
 
 
 def center_distance_match(candidates, truths):
-    if len(candidates) == 0 or len(truths) == 0:
+    if len(candidates) == 0:
         return np.zeros((0,), dtype=np.int32), np.zeros((0,), dtype=np.int32) - 1
+    if len(truths) == 0:
+        return np.zeros((len(candidates),), dtype=np.int32), np.zeros((len(candidates),), dtype=np.int32) - 1
 
     order = np.argsort(candidates[:, 0])[::-1]
     matched_truth = np.zeros((len(truths),), dtype=bool)
@@ -112,7 +114,13 @@ def center_distance_match(candidates, truths):
 
 
 def update_detection_meter(meter, proposals, truth_boxes):
-    proposals = np.asarray(proposals, dtype=np.float32).reshape(-1, 8)
+    proposals = np.asarray(proposals, dtype=np.float32)
+    if proposals.size == 0:
+        proposals = np.empty((0, 8), dtype=np.float32)
+    elif proposals.ndim == 1:
+        proposals = proposals.reshape(1, -1)
+    if proposals.shape[1] < 8:
+        raise ValueError("proposals must have at least 8 columns, got shape %s" % (proposals.shape,))
     truth_boxes = np.asarray(truth_boxes, dtype=np.float32).reshape(-1, 6)
     meter['num_scans'] += 1
     meter['num_gt'] += len(truth_boxes)
