@@ -314,8 +314,9 @@ class BboxReader(Dataset):
                 isScale = self.augtype['scale'] and (self.mode=='train')
                 sample, target, bboxes, coord = self.crop(imgs, bbox[1:], bboxes,isScale,is_random_crop)
                 if self.mode == 'train' and not is_random_crop:
-                     sample, target, bboxes = augment(sample, target, bboxes, do_flip = self.augtype['flip'], 
-                                                             do_rotate=self.augtype['rotate'], do_swap = self.augtype['swap'])
+                     sample, target, bboxes = augment(sample, target, bboxes, do_flip = self.augtype['flip'],
+                                                             do_rotate=self.augtype['rotate'], do_swap = self.augtype['swap'],
+                                                             pad_value=self.pad_value)
                 if self.mode == 'train':
                     sample = augment_intensity(
                         sample,
@@ -561,7 +562,7 @@ def _swap_corner_boxes(boxes, axisorder):
     return swapped
 
 
-def augment(sample, target, bboxes, do_flip = True, do_rotate=True, do_swap = True):
+def augment(sample, target, bboxes, do_flip = True, do_rotate=True, do_swap = True, pad_value=170):
     #  angle1 = np.random.rand()*180
     target = np.asarray(target, dtype=np.float32)
     bboxes = np.asarray(bboxes, dtype=np.float32)
@@ -585,7 +586,16 @@ def augment(sample, target, bboxes, do_flip = True, do_rotate=True, do_swap = Tr
             if not np.isfinite(newtarget[:6]).all() or _box_inside_shape(newtarget, sample.shape[1:4]):
                 validrot = True
                 target = newtarget
-                sample = rotate(sample,angle1,axes=(2,3),reshape=False)
+                sample = rotate(
+                    sample,
+                    angle1,
+                    axes=(2, 3),
+                    reshape=False,
+                    order=1,
+                    mode='constant',
+                    cval=float(pad_value),
+                    prefilter=False,
+                )
                 bboxes = newbboxes
             else:
                 counter += 1
@@ -613,12 +623,12 @@ def augment(sample, target, bboxes, do_flip = True, do_rotate=True, do_swap = Tr
                 dim = np.array(sample.shape[i + 1])
                 target_min = np.copy(target[ax])
                 target_max = np.copy(target[ax + 1])
-                target[ax] = dim - target_max
-                target[ax + 1] = dim - target_min
+                target[ax] = dim - 1 - target_max
+                target[ax + 1] = dim - 1 - target_min
                 box_min = np.copy(bboxes[:, ax])
                 box_max = np.copy(bboxes[:, ax + 1])
-                bboxes[:, ax] = dim - box_max
-                bboxes[:, ax + 1] = dim - box_min
+                bboxes[:, ax] = dim - 1 - box_max
+                bboxes[:, ax + 1] = dim - 1 - box_min
     return sample, target, bboxes
 
 

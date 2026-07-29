@@ -49,6 +49,8 @@ def check_flip_yx():
             do_swap=False,
         )
     expected = nonzero_box(out)
+    if int(expected[2]) != 17 or int(expected[3]) != 22:
+        raise AssertionError("flip should map y=[9,14] to y=[17,22], got %s" % expected)
     assert_close("flip box", boxes_out[0], expected)
     assert_close("flip target", target_out, expected)
 
@@ -79,16 +81,57 @@ def check_rotate_90_degrees():
             do_flip=False,
             do_rotate=True,
             do_swap=False,
+            pad_value=0,
         )
     expected = nonzero_box(out)
     assert_close("rotate box", boxes_out[0], expected)
     assert_close("rotate target", target_out, expected)
 
 
+def check_rotate_uses_pad_value():
+    sample, target, bboxes = make_sample(shape=(1, 32, 32, 32), box=(8, 12, 9, 14, 10, 16))
+    seen = {}
+
+    def fake_rotate(input_sample, angle, axes, reshape, order, mode, cval, prefilter):
+        seen.update({
+            "axes": axes,
+            "reshape": reshape,
+            "order": order,
+            "mode": mode,
+            "cval": cval,
+            "prefilter": prefilter,
+        })
+        return input_sample
+
+    with patch.object(bbox_reader.np.random, "rand", return_value=0.1), \
+            patch.object(bbox_reader, "rotate", side_effect=fake_rotate):
+        augment(
+            sample,
+            target,
+            bboxes,
+            do_flip=False,
+            do_rotate=True,
+            do_swap=False,
+            pad_value=170,
+        )
+
+    expected = {
+        "axes": (2, 3),
+        "reshape": False,
+        "order": 1,
+        "mode": "constant",
+        "cval": 170.0,
+        "prefilter": False,
+    }
+    if seen != expected:
+        raise AssertionError("rotate args got %s, expected %s" % (seen, expected))
+
+
 def main():
     check_flip_yx()
     check_swap_axes()
     check_rotate_90_degrees()
+    check_rotate_uses_pad_value()
     print("ok: corner-format bbox augmentation checks passed")
 
 
