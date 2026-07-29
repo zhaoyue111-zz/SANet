@@ -1,0 +1,2 @@
+pid,ct_shape_zyx,nifti_size_xyz,gt_count,before_count,after_count,ct,gt_mask,fp_before_mask,fp_after_mask
+00075,306x168x272,272x168x306,1,44,22,fp_dedup_nii/00075_ct.nii.gz,fp_dedup_nii/00075_gt_mask.nii.gz,fp_dedup_nii/00075_fp_before_mask.nii.gz,fp_dedup_nii/00075_fp_after_mask.nii.gz

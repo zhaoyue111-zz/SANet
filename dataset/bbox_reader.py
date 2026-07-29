@@ -7,9 +7,13 @@ import warnings
 from scipy.ndimage import rotate
 import math
 import time
-import nrrd
 import pandas as pd
 import random
+
+try:
+    import nrrd
+except ImportError:
+    nrrd = None
 
 
 def _pid_keys(value):
@@ -127,6 +131,7 @@ class BboxReader(Dataset):
         self.r_rand = cfg['r_rand_crop']
         self.augtype = cfg['augtype']
         self.pad_value = cfg['pad_value']
+        self.partial_gt_positive_threshold = float(cfg.get('partial_gt_positive_threshold', 0.5))
         self.data_dir = data_dir
         self.stride = cfg['stride']
         self.blacklist = cfg['blacklist']
@@ -348,7 +353,11 @@ class BboxReader(Dataset):
                 print(filename, sample.shape)
 
             sample = (sample.astype(np.float32)-128)/128
-            bboxes = fillter_box(bboxes, self.cfg['crop_size'])
+            bboxes = build_patch_truth_boxes(
+                bboxes,
+                self.cfg['crop_size'],
+                self.partial_gt_positive_threshold,
+            )
             bboxes = corner_form_to_center_form(bboxes, self.cfg['bbox_border'])
             bboxes = np.asarray(bboxes, dtype=np.float32).reshape(-1, 7)
             truth_labels = bboxes[:, -1].astype(np.int64)
@@ -414,14 +423,65 @@ def corner_form_to_center_form(boxes, border):
     '''
     bboxes = []
     for box in boxes:
+        label = int(box[6]) if len(box) > 6 else 1
         bboxes.append([(box[0] + box[1]) / 2.,
                        (box[2] + box[3]) / 2.,
                        (box[4] + box[5]) / 2.,
                        box[1] - box[0] + 1 + border,
                        box[3] - box[2] + 1 + border,
                        box[5] - box[4] + 1 + border,
-                       1])
+                       label])
     return bboxes
+
+
+def build_patch_truth_boxes(bboxes, size, partial_positive_threshold=0.5):
+    """
+    Rebuild patch supervision from all original GT boxes after crop translation.
+
+    Output columns are zmin,zmax,ymin,ymax,xmin,xmax,label in patch coordinates.
+    label=1 means positive supervision; label=-1 means ignore.
+    """
+    size = np.asarray(size, dtype=np.float32)
+    bboxes = np.asarray(bboxes, dtype=np.float32)
+    if bboxes.size == 0:
+        return np.zeros((0, 7), dtype=np.float32)
+    if bboxes.ndim == 1:
+        bboxes = bboxes.reshape(1, -1)
+
+    threshold = float(partial_positive_threshold)
+    patch_min = np.zeros(3, dtype=np.float32)
+    patch_max = size - 1.0
+    out = []
+    for box in bboxes:
+        if len(box) < 6 or not np.isfinite(box[:6]).all():
+            continue
+        starts = box[[0, 2, 4]].astype(np.float32)
+        ends = box[[1, 3, 5]].astype(np.float32)
+        gt_sizes = ends - starts + 1.0
+        if np.any(gt_sizes <= 0):
+            continue
+
+        inter_starts = np.maximum(starts, patch_min)
+        inter_ends = np.minimum(ends, patch_max)
+        inter_sizes = inter_ends - inter_starts + 1.0
+        if np.any(inter_sizes <= 0):
+            continue
+
+        visible_ratio = float(np.prod(inter_sizes) / np.prod(gt_sizes))
+        clipped = np.array([
+            inter_starts[0], inter_ends[0],
+            inter_starts[1], inter_ends[1],
+            inter_starts[2], inter_ends[2],
+        ], dtype=np.float32)
+        if visible_ratio >= threshold:
+            label = 1
+        else:
+            label = -1
+        out.append(np.concatenate([clipped, np.array([label], dtype=np.float32)]))
+
+    if not out:
+        return np.zeros((0, 7), dtype=np.float32)
+    return np.asarray(out, dtype=np.float32).reshape(-1, 7)
 
 def pad2factor(image, factor=32, pad_value=0):
     depth, height, width = image.shape
@@ -466,23 +526,67 @@ def fillter_box(bboxes, size):
         return np.zeros((0, num_cols), dtype=np.float32)
     return np.asarray(res, dtype=np.float32).reshape(-1, num_cols)
 
+def _transform_corner_box_yx(box, rotmat, center_yx):
+    corners = np.asarray([
+        [box[2], box[4]],
+        [box[2], box[5]],
+        [box[3], box[4]],
+        [box[3], box[5]],
+    ], dtype=np.float32)
+    rotated = np.dot(corners - center_yx, rotmat.T) + center_yx
+    out = np.copy(box)
+    out[2] = rotated[:, 0].min()
+    out[3] = rotated[:, 0].max()
+    out[4] = rotated[:, 1].min()
+    out[5] = rotated[:, 1].max()
+    return out
+
+
+def _box_inside_shape(box, shape_zyx):
+    starts = np.asarray(box[[0, 2, 4]], dtype=np.float32)
+    ends = np.asarray(box[[1, 3, 5]], dtype=np.float32)
+    shape_zyx = np.asarray(shape_zyx, dtype=np.float32)
+    return np.all(starts >= 0) and np.all(ends < shape_zyx) and np.all(ends > starts)
+
+
+def _swap_corner_boxes(boxes, axisorder):
+    boxes = np.asarray(boxes, dtype=np.float32)
+    if boxes.size == 0:
+        return boxes
+    swapped = np.copy(boxes)
+    pair_starts = boxes[:, [0, 2, 4]]
+    pair_ends = boxes[:, [1, 3, 5]]
+    swapped[:, [0, 2, 4]] = pair_starts[:, axisorder]
+    swapped[:, [1, 3, 5]] = pair_ends[:, axisorder]
+    return swapped
+
+
 def augment(sample, target, bboxes, do_flip = True, do_rotate=True, do_swap = True):
     #  angle1 = np.random.rand()*180
+    target = np.asarray(target, dtype=np.float32)
+    bboxes = np.asarray(bboxes, dtype=np.float32)
+    if bboxes.size == 0:
+        bboxes = bboxes.reshape(0, 6)
     if do_rotate:
         validrot = False
         counter = 0
         while not validrot:
             newtarget = np.copy(target)
+            newbboxes = np.copy(bboxes)
             angle1 = np.random.rand()*180
-            size = np.array(sample.shape[2:4]).astype('float')
+            center_yx = (np.array(sample.shape[2:4]).astype(np.float32) - 1.0) / 2.0
             rotmat = np.array([[np.cos(angle1/180*np.pi),-np.sin(angle1/180*np.pi)],[np.sin(angle1/180*np.pi),np.cos(angle1/180*np.pi)]])
-            newtarget[1:3] = np.dot(rotmat,target[1:3]-size/2)+size/2
-            if np.all(newtarget[:3]>target[3]) and np.all(newtarget[:3]< np.array(sample.shape[1:4])-newtarget[3]):
+            if len(newtarget) >= 6 and np.isfinite(newtarget[:6]).all():
+                newtarget = _transform_corner_box_yx(newtarget, rotmat, center_yx)
+            for i in range(len(newbboxes)):
+                if np.isfinite(newbboxes[i, :6]).all():
+                    newbboxes[i] = _transform_corner_box_yx(newbboxes[i], rotmat, center_yx)
+
+            if not np.isfinite(newtarget[:6]).all() or _box_inside_shape(newtarget, sample.shape[1:4]):
                 validrot = True
                 target = newtarget
                 sample = rotate(sample,angle1,axes=(2,3),reshape=False)
-                for box in bboxes:
-                    box[1:3] = np.dot(rotmat,box[1:3]-size/2)+size/2
+                bboxes = newbboxes
             else:
                 counter += 1
                 if counter ==3:
@@ -491,8 +595,8 @@ def augment(sample, target, bboxes, do_flip = True, do_rotate=True, do_swap = Tr
         if sample.shape[1]==sample.shape[2] and sample.shape[1]==sample.shape[3]:
             axisorder = np.random.permutation(3)
             sample = np.transpose(sample,np.concatenate([[0],axisorder+1]))
-            target[:3] = target[:3][axisorder]
-            bboxes[:,:3] = bboxes[:,:3][:,axisorder]
+            target = _swap_corner_boxes(target.reshape(1, -1), axisorder).reshape(-1)
+            bboxes = _swap_corner_boxes(bboxes, axisorder)
 
     if do_flip:
         # flipid = np.array([np.random.randint(2),np.random.randint(2),np.random.randint(2)])*2-1

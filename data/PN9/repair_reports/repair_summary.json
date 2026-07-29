@@ -1,0 +1,12 @@
+{
+  "sanet_dir": "/data/医保大赛/code/SANet/data/PN9",
+  "full_dir": "/data/医保大赛/code/SANet/data/PN9/full",
+  "pid_map_csv": "/data/医保大赛/code/SANet/data/PN9/missing_pn9_files.csv",
+  "pn9_root": "/media/SENSETIME\\yangtingting/T7/医保大赛数据/PN9/npy",
+  "lung_mask_root": "/media/SENSETIME\\yangtingting/T7/医保大赛数据/lungseg/PN9",
+  "expected": 2,
+  "existing_before": 2,
+  "missing_before": 2,
+  "converted": 2,
+  "unresolved": 0
+}

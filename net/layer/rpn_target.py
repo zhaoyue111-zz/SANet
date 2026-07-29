@@ -9,6 +9,14 @@ from net.layer.rpn_nms import rpn_encode
 from torch.autograd import Variable
 
 
+def _overlap_to_numpy(overlap):
+    if hasattr(overlap, 'detach'):
+        return overlap.detach().cpu().numpy()
+    return overlap
+
+'''
+ 给 anchor 分配正负标签和 bbox 回归目标
+ '''
 def make_one_rpn_target(cfg, mode, input, window, truth_box, truth_label):
     """
     Generate region proposal targets for one batch
@@ -38,13 +46,20 @@ def make_one_rpn_target(cfg, mode, input, window, truth_box, truth_label):
     target_weight = np.zeros((num_window, ), np.float32)
 
 
-    num_truth_box = len(truth_box)
+    truth_box = np.asarray(truth_box, dtype=np.float32).reshape(-1, 6)
+    truth_label = np.asarray(truth_label, dtype=np.int64).reshape(-1)
+    pos_index = np.where(truth_label > 0)[0]
+    ignore_index = np.where(truth_label < 0)[0]
+    pos_truth_box = truth_box[pos_index]
+    ignore_truth_box = truth_box[ignore_index]
+
+    num_truth_box = len(pos_truth_box)
     if num_truth_box:
 
         _, depth, height, width = input.size()
 
         # Get sure background anchor boxes
-        overlap = torch_overlap(window, truth_box)
+        overlap = _overlap_to_numpy(torch_overlap(window, pos_truth_box))
 
         # For each anchor box, get the index of the ground truth box that
         # has the largest IoU with it
@@ -83,6 +98,7 @@ def make_one_rpn_target(cfg, mode, input, window, truth_box, truth_label):
         # In case one ground truth box within one batch has way too many positive anchors, 
         # which may affect the sample in the loss fucntion,
         # we only random one positive anchor for each ground truth box
+        # 每个GT只保留 1 个正样本
         fg_index = np.where(label != 0)[0]
         idx = random.sample(range(len(fg_index)), 1)
         label[fg_index] = 0
@@ -95,15 +111,15 @@ def make_one_rpn_target(cfg, mode, input, window, truth_box, truth_label):
         # Prepare regression terms for each positive anchor
         fg_index = np.where(label != 0)[0]
         target_window = window[fg_index]
-        target_truth_box = truth_box[label_assign[fg_index]]
+        target_truth_box = pos_truth_box[label_assign[fg_index]]
         target[fg_index] = rpn_encode(target_window, target_truth_box, cfg['box_reg_weight'])
         target_weight[fg_index] = 1
 
-        # This should by no means be used, left just in case
-        invalid_truth_label = np.where(truth_label < 0)[0]
-        invalid_index = np.isin(label_assign, invalid_truth_label) & (label!=0)
-        label_weight[invalid_index] = 0
-        target_weight[invalid_index] = 0
+        if len(ignore_truth_box):
+            ignore_overlap = _overlap_to_numpy(torch_overlap(window, ignore_truth_box))
+            ignore_anchor_index = np.where(ignore_overlap.max(axis=1) > 0)[0]
+            label_weight[ignore_anchor_index] = 0
+            target_weight[ignore_anchor_index] = 0
 
         if mode in ['train']:
             fg_index = np.where( (label_weight!=0) & (label!=0))[0]
@@ -113,6 +129,7 @@ def make_one_rpn_target(cfg, mode, input, window, truth_box, truth_label):
             # This is very strange, but it works well in practice
             # It makes the use of hard negative example mining loss, not 
             # actually hard negative example mining.
+            # 随机采样最多num_neg个负样本
             label_weight[bg_index] = 0
             idx = random.sample(range(len(bg_index)), min(num_neg, len(bg_index)))
             bg_index = bg_index[idx]
@@ -120,12 +137,17 @@ def make_one_rpn_target(cfg, mode, input, window, truth_box, truth_label):
             # Calculate weight for class balance
             num_fg = max(1, len(fg_index))
             num_bg = len(bg_index)
-            label_weight[bg_index] = float(num_fg)/num_bg
+            if num_bg > 0:
+                label_weight[bg_index] = float(num_fg) / num_bg
 
         target_weight[fg_index] = label_weight[fg_index]
     else:
         # if there is no ground truth box in this batch
         label_weight[...] = 1
+        if len(ignore_truth_box):
+            ignore_overlap = _overlap_to_numpy(torch_overlap(window, ignore_truth_box))
+            ignore_anchor_index = np.where(ignore_overlap.max(axis=1) > 0)[0]
+            label_weight[ignore_anchor_index] = 0
 
         if mode in ['train']:
             bg_index = np.where((label_weight!=0) & (label==0))[0]
@@ -133,7 +155,8 @@ def make_one_rpn_target(cfg, mode, input, window, truth_box, truth_label):
             label_weight[bg_index] = 0
             idx = random.sample(range(len(bg_index)), min(num_neg, len(bg_index)))
             bg_index = bg_index[idx]
-            label_weight[bg_index] = 1.0 / len(bg_index)
+            if len(bg_index) > 0:
+                label_weight[bg_index] = 1.0 / len(bg_index)
 
 
     label = Variable(torch.from_numpy(label)).cuda()
@@ -154,8 +177,12 @@ def make_rpn_target(cfg, mode, inputs, window, truth_boxes, truth_labels):
     batch_size = len(inputs)
     for b in range(batch_size):
         input = inputs[b]
-        truth_box   = truth_boxes[b]
-        truth_label = truth_labels[b]
+        truth_box = np.asarray(truth_boxes[b], dtype=np.float32).reshape(-1, 6)
+        truth_label = np.asarray(truth_labels[b], dtype=np.int64).reshape(-1)
+        if len(truth_box):
+            valid = np.isfinite(truth_box).all(axis=1) & (truth_box[:, 3:6] > 0).all(axis=1)
+            truth_box = truth_box[valid]
+            truth_label = truth_label[valid]
 
         rpn_label, rpn_label_assign, rpn_label_weight, rpn_target, rpn_targets_weight = \
             make_one_rpn_target(cfg, mode, input, window, truth_box, truth_label)

@@ -1,0 +1,225 @@
+## 1. sheet1 中各数据集的特点
+
+| 数据集                              |                                                                                   数据规模/标注 | 更适合的任务           | 对 SANet 的适配难度 | 核心问题                                                        |
+| -------------------------------- | ----------------------------------------------------------------------------------------: | ---------------- | ------------- | ----------------------------------------------------------- |
+| **PN9**                          |                                                      8798 CT，40439 个结节，9 类结节；SANet 原论文数据集 | 3D 肺结节检测         | **最低**        | 本身就是 SANet 格式/同源数据，基本只需要配置路径                                |
+| **LNDb v4**                      | 294 CT，带结节标注、mask、报告/属性信息；Zenodo 说明 LNDb 是用于外部验证 CAD 系统的 CT 数据库，包含 294 例 CT ([Zenodo][1]) | 检测、分割、属性分析       | 中等            | 要从 mask 或标注文件转成 SANet 的 3D bbox                             |
+| **Histopathology-based Dataset** |                95 CT，330 个 bbox 结节，带病理/癌种标签；论文摘要说明其包含 95 名患者、330 个 bbox 标注结节 ([arXiv][2]) | 小样本检测 + 良恶性/癌种分类 | 中等偏低          | 有 bbox，适合转 SANet；但样本少，训练检测器容易过拟合                            |
+| **NLSTseg**                      |            605 名患者 LDCT，715 个像素级病灶，其中 662 肿瘤、53 结节；论文说明基于 NLST 并提供像素级肺部病灶标注 ([Nature][3]) | 分割、肺癌/病灶定位       | 中等偏高          | 是 segmentation，不是 detection；要从 mask 提 bbox，且“肿瘤/结节”任务定义要先统一 |
+
+一句话判断：**PN9 是直接复现 SANet/LSSANet 的主数据集；LNDb 和 NLSTseg 更像“分割/外部验证数据”；Histopathology-based Dataset 更像“小样本、有病理标签的检测+分类数据”。**
+
+---
+
+## 2. SANet 的数据处理流程到底需要什么
+
+SANet repo 明确说 PN9 提供的是**已经预处理后的数据**，包括两件事：**空间归一化到 1 mm × 1 mm × 1 mm**，以及把数据强度转换到 **[0,255]**；`.npy` 保存精确值，`.jpg` 是压缩版 ([GitHub][4])。
+
+SANet 代码里默认输入不是 DICOM/MHD，而是：
+DATA_DIR/
+  00001_zoom.npy
+  00002_zoom.npy
+  ...
+
+split_full_with_nodule_9classes/
+  train.txt
+  val.txt
+  test.txt
+  train_anno.csv
+  test_anno.csv
+
+
+配置里也能看到它默认 `crop_size=[128,128,128]`、`bbox_border=8`、`pad_value=170`，anchor 尺寸是 `[5,10,20,30,50]`，训练列表和标注路径分别指向 `train.txt/val.txt/test.txt` 和 `train_anno.csv/test_anno.csv` ([GitHub][5])。读取器要求 annotation CSV 里至少有：
+
+```text
+pid,zmin,zmax,ymin,ymax,xmin,xmax
+```
+代码中就是按 `pid` 匹配，然后取 `zmin,zmax,ymin,ymax,xmin,xmax` 作为 box；训练时读取 `{pid}_zoom.npy`，再裁成 128³ patch，并做 `(sample-128)/128` 标准化。
+
+所以要用 SANet，所有数据集最终都要变成：
+
+每个 CT：1 个 3D npy，shape [1, D, H, W]  轴顺序 [通道, z, y, x]
+每个结节：1 行 3D bbox，坐标是重采样到 1mm 后的 voxel 坐标
+强度：0-255
+HU截断：[-1200, 600]
+空间：1mm × 1mm × 1mm
+任务：默认单类nodule detection（有多个就在annotation csv中插入多行）
+```
+
+---
+
+## 3. 各数据集具体该怎么处理
+
+### A. PN9：基本不用再做预处理
+
+PN9 是 SANet 原生数据，repo 里也说明 PN9 有 `.npy` 和 `.jpg` 两种版本，默认更推荐 `.npy`。你之前那个目录里有 `train.00` 到 `train.13`，这类应该是分卷压缩包，解压后会得到 SANet 需要的 `.npy` 和列表文件。
+
+你需要做的是：
+cat train.* > train.tar.gz
+tar xvzf train.tar.gz
+
+然后检查是否有：
+train.txt
+val.txt
+train_anno.csv
+*_zoom.npy
+
+再把 SANet 的 `config.py` 里：
+BASE = '/home/media/ssd/process_zoom/'
+改成你的 PN9 根目录，比如：BASE = '/data/医保大赛/dataset/PN9/npy/'
+
+如果你目录结构是：
+/data/医保大赛/dataset/PN9/npy/train/
+  train.txt
+  val.txt
+  train_anno.csv
+  xxx_zoom.npy
+那就要把：
+preprocessed_data_dir
+train_set_list
+val_set_list
+train_anno
+全部对齐。**PN9 不要再重采样、不要再 HU 截断、不要再 [0,255] 归一化一次**，否则等于二次预处理，会把强度分布弄坏。
+
+---
+
+### B. LNDb v4：从 mask/标注转成 SANet 3D bbox
+
+LNDb 的优势是 CT、结节标注、mask、报告属性比较全；Zenodo 页面说明 LNDb v4 还加入了 `allNods.csv`、`chars_trainNodules.csv`、`report.csv`、`rad2Fleischner.csv` 等信息。但 SANet 不吃这些丰富属性，它只吃 **3D box 检测标签**。
+
+处理流程建议：
+原始 MHD/RAW CT
+→ 读取 HU
+→ 读取 nodule mask 或结节标注
+→ 统一方向到 [z,y,x]
+→ 重采样到 1mm × 1mm × 1mm
+→ mask 同步最近邻重采样
+→ 每个 nodule mask 提取 bbox
+→ CT 强度映射到 [0,255]
+→ 保存 {pid}_zoom.npy
+→ 生成 train/val/test.txt 和 train_anno.csv/test_anno.csv
+```
+
+LNDb 重点坑位：
+1. **坐标轴顺序**
+   MHD 常见读出来是 `[z,y,x]`，但 world coordinate 可能是 `[x,y,z]`。转 bbox 前一定要可视化抽查，不然 box 会整体错位。
+2. **mask 到 box**
+   对每个 nodule mask 做 connected component 或按 nodule ID 分离，然后取：
+   zmin,zmax = zs.min(), zs.max()
+   ymin,ymax = ys.min(), ys.max()
+   xmin,xmax = xs.min(), xs.max()
+3. **任务定义**
+   如果你只做“肺结节检测”，LNDb 可以作为外部测试集；如果混入 PN9 一起训练，建议统一为单类 `nodule`，不要一开始引入属性分类。
+
+---
+
+### C. Histopathology-based Dataset：最适合做“SANet 检测 + 后续病理分类”
+
+这个数据集有 3D bbox 和病理标签。论文摘要明确说它包含 95 名患者、330 个 bbox 标注结节，目标之一是补充带专家癌种信息的数据不足 ([arXiv][2])。GitHub README 也说明 Version 1 有 BMP/MHD 格式和 CSV 标注，Version 2 是原始 DICOM；检测、分类代码都有，且提供 `augment.py/augment_2D.py` 做 3D/2D 预处理 ([GitHub][7])。
+如果你要接 SANet，优先用 **Version 1 的 MHD_3D + all_anno_3D.csv / anno_WorldCoord.csv**，别从 2D BMP 开始。处理流程：
+MHD_3D 或 DICOM
+→ 读取 CT
+→ 如果是 DICOM：按 InstanceNumber/ImagePositionPatient 排序成 3D volume
+→ slope/intercept 转 HU
+→ 根据 CSV bbox/world coord 得到结节框
+→ 重采样到 1mm
+→ bbox 坐标同步缩放到 1mm voxel 坐标
+→ intensity 转 [0,255]
+→ 保存 {pid}_zoom.npy
+→ 生成 SANet annotation CSV
+
+这里有一个策略选择：
+**方案 1：按 SANet 原版，全部当作单类 nodule。**
+最简单，改动最少：
+roi_names = ['nodule']
+num_class = 2
+**方案 2：改 SANet 做多类别检测。**
+比如良性、腺癌、鳞癌。这个不建议第一版做，因为 SANet 的 reader 现在直接把所有 box label 写成 `1`，需要改 `truth_labels`、loss、评估脚本，工作量会明显增加。
+我的建议是：**第一阶段先做 SANet 单类检测，第二阶段对 SANet 检出的候选结节 crop 再做病理/癌种分类。** 这更稳，且符合数据集本身“小样本但有病理标签”的价值。
+---
+
+### D. NLSTseg：先把 segmentation mask 转成 detection bbox
+NLSTseg 是 pixel-level lesion segmentation 数据，不是标准肺结节检测数据。论文说明它收集了 605 名患者 LDCT，并由放射科医生提供像素级标注，最终包含 662 个 tumors 和 53 个 nodules ([Nature][3])。Zenodo 页面显示发布的是多个 `LungTumor.zip` 文件，整体是一个分割数据集资源 ([Zenodo][8])。
+如果用 SANet，有两种路线：
+**路线 1：只检测 nodule。**
+只保留 53 个 nodule。问题是样本太少，单独训练 SANet 不现实，更适合作为测试集或少量微调集。
+**路线 2：检测 lung lesion，包括 tumor + nodule。**
+把 662 tumor 和 53 nodule 都转成 bbox，任务名称改成“肺部病灶检测”。这更有训练量，但和 PN9 的“肺结节检测”任务不完全一致。
+
+处理流程：
+LDCT volume + lesion mask
+→ 统一 volume/mask 对齐
+→ 重采样到 1mm
+→ 对每个 lesion mask 做 connected component
+→ 每个 component 转 bbox
+→ 大病灶/肿块单独标记
+→ intensity 转 [0,255]
+→ 保存 {pid}_zoom.npy
+→ 生成 SANet annotation CSV
+
+NLSTseg 重点坑位：
+1. **肿瘤可能很大**
+   SANet 默认 anchor 是 `[5,10,20,30,50]` mm 左右，适合小结节。若包含大肿瘤，建议加大 anchor，例如：
+   bases = [5, 10, 20, 30, 50, 80, 120]
+   同时考虑把 `crop_size` 从 `[128,128,128]` 保持不变或增大到 `[160,160,160]`，取决于显存。
+2. **任务口径要写清楚**
+   如果论文里写“pulmonary nodule detection”，最好不要把 662 个 tumor 全混进去；否则审稿人会问：你到底是在做 nodule detection 还是 lesion/tumor detection？
+
+---
+
+## 4. 最推荐的实验安排
+
+我建议你不要一上来四个数据集混训，先这样做：
+
+| 阶段     | 数据                   | 目的                                         |
+| ------ | -------------------- | ------------------------------------------ |
+| Step 1 | PN9                  | 跑通 SANet 原版 pipeline，确认代码、数据、FROC 评估都没问题   |
+| Step 2 | PN9 → Histopathology | 用 PN9 预训练，再在小病理数据集上微调检测器                   |
+| Step 3 | PN9 → LNDb           | 做外部验证，测试泛化能力                               |
+| Step 4 | PN9/LNDb → NLSTseg   | 只在明确任务口径后使用：nodule-only 或 lesion detection |
+
+如果你的目标是“顶会论文式实验”，更合理的设置是：
+
+```text
+主实验：PN9 supervised detection
+泛化实验：PN9 train → LNDb / Histopathology / NLSTseg test
+小样本迁移：PN9 pretrained → Histopathology fine-tune
+消融：是否使用 1mm 重采样、是否使用 lung mask、是否统一 [0,255]
+```
+
+---
+
+## 5. 最终要统一成的文件格式
+
+不管哪个数据集，最后都建议整理成：
+
+```text
+SANet_ready/
+  full/
+    000001_zoom.npy
+    000002_zoom.npy
+    ...
+  split/
+    train.txt
+    val.txt
+    test.txt
+    train_anno.csv
+    test_anno.csv
+```
+
+`train_anno.csv` 格式：
+
+```csv
+pid,zmin,zmax,ymin,ymax,xmin,xmax（voxel坐标）
+000001,40,55,210,238,180,205
+000001,80,92,150,168,300,318
+000002,30,43,120,140,250,270
+```
+
+但注意：SANet 原代码里有一句：
+annos = annos_all[annos_all['pid'] == int(fn)]
+所以如果你的 `pid` 是 `LNDb-0001`、`Patient001` 这种字符串，要么改代码去掉 `int(fn)`，要么给每个病例做一个数字 ID 映射。这个坑很小，但非常容易卡半天。
+
+---
+
+最核心的判断：**PN9 直接用；Histopathology-based Dataset 转 bbox 后很好用；LNDb 从 mask/标注转 bbox 后适合外部验证；NLSTseg 必须先把 segmentation mask 转 detection bbox，并且要决定到底检测 nodule 还是 lesion。**

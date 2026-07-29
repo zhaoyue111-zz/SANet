@@ -1,0 +1,7 @@
+[
+  {
+    "case": "LNDb-0059",
+    "mask": "/media/SENSETIME\\yangtingting/T7/医保大赛数据/LNDb/LNDb/LNDb-0059_nid4_mask.nii.gz",
+    "warning": "empty_or_too_small_mask"
+  }
+]

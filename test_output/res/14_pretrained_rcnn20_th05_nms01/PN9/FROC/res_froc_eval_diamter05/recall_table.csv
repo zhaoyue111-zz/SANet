@@ -1,0 +1,2 @@
+dataset,recall@0.125/scan,recall@0.25/scan,recall@0.5/scan,recall@1/scan,recall@2/scan,recall@4/scan,recall@8/scan,recall@16/scan,recall@unlimited
+PN9,0.130333,0.260666,0.483902,0.608031,0.729979,0.821322,0.876119,0.916418,0.946908

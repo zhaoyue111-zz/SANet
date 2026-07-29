@@ -1,0 +1,20 @@
+执行：
+python setup.py install
+running install
+报错：
+overlap.cpp:8:5: error: ‘AT_CHECK’ was not declared in this scope; did you mean ‘CHECK’?
+    8 |     AT_CHECK(boxes1->is_contiguous(), "argument#1(boxes1) must be contiguous");
+      |     ^~~~~~~~
+      |     CHECK
+原因：SANet 的 build/box 扩展代码太旧，里面用了旧版 PyTorch 的 AT_CHECK，但你当前环境的 PyTorch 已经不支持它了。
+解决方案：把 overlap.cpp和 nms.cpp 中的 AT_CHECK 替换成 TORCH_CHECK 就可以了。
+具体实施策略：
+1. 对overlap.cpp 和 nms.cpp 文件备份：
+cp nms.cpp nms.cpp.bak
+cp overlap.cpp overlap.cpp.bak
+2. 替换 AT_CHECK 为 TORCH_CHECK：
+sed -i 's/AT_CHECK/TORCH_CHECK/g' nms.cpp overlap.cpp
+3. 顺手把过时的 .data<T>() 改成 .data_ptr<T>()
+sed -i 's/\.data</.data_ptr</g' nms.cpp overlap.cpp
+4. 清理旧编译缓存：rm -rf build *.egg-info
+5. 重新安装：python setup.py install

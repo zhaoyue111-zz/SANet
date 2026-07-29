@@ -1,135 +1,181 @@
+"""Visualize SANet-ready volumes and 3D bounding boxes in three views."""
 '''
-可视化SANet预处理后的数据，验证npy文件和标注是否正确
+可视化处理后数据集的工具，给定PID和nodule_id，找到对应的体积数据和标注，
+在三个视图（轴向、冠状、矢状）中显示切片和标注框，并保存为PNG图片。
 '''
 
-import os
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
+import argparse
 from pathlib import Path
 
-def visualize_sanet_output(sanet_dir, case_pid=None, slice_idx=None):
-    """
-    可视化SANet预处理后的数据，验证npy文件和标注是否正确
-    
-    参数:
-        sanet_dir: SANet输出目录路径
-        case_pid: 要可视化的病例PID（如 1, 2, 5），None则随机选择一个有标注的病例
-        slice_idx: 要可视化的切片索引，None则自动选择有结节的切片
-    """
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+import numpy as np
+import pandas as pd
+
+
+def normalize_pid(value: str, width: int = 5) -> str:
+    return str(value).strip().zfill(width)
+
+
+def load_volume(path: Path) -> np.ndarray:
+    volume = np.load(path)
+    if volume.ndim != 4 or volume.shape[0] != 1:
+        raise ValueError(f"Expected [1,D,H,W], got {volume.shape}: {path}")
+    return volume[0]
+
+
+def load_annotations(sanet_dir: Path) -> pd.DataFrame:
+    split_dir = sanet_dir / "split"
+    all_path = split_dir / "all_anno.csv"
+    if all_path.exists():
+        return pd.read_csv(all_path)
+
+    paths = [
+        split_dir / name
+        for name in ["train_anno.csv", "val_anno.csv", "test_anno.csv"]
+        if (split_dir / name).exists()
+    ]
+    if not paths:
+        raise FileNotFoundError(f"No annotation CSV found under {split_dir}")
+    return pd.concat([pd.read_csv(path) for path in paths], ignore_index=True).drop_duplicates()
+
+
+def select_annotation(
+    annotations: pd.DataFrame,
+    pid: int,
+    nodule_id: int | None,
+) -> pd.Series:
+    case_rows = annotations[annotations["pid"].astype(int) == int(pid)]
+    if case_rows.empty:
+        raise ValueError(f"PID {pid} has no annotations")
+    if nodule_id is not None:
+        case_rows = case_rows[case_rows["nodule_id"].astype(int) == nodule_id]
+        if case_rows.empty:
+            raise ValueError(f"PID {pid} has no nodule_id={nodule_id}")
+    return case_rows.iloc[0]
+
+
+def add_box(ax, xy, width, height, label):
+    ax.add_patch(
+        Rectangle(
+            xy,
+            width,
+            height,
+            fill=False,
+            edgecolor="lime",
+            linewidth=2,
+        )
+    )
+    ax.text(
+        xy[0],
+        xy[1] - 3,
+        label,
+        color="lime",
+        fontsize=9,
+        bbox={"facecolor": "black", "alpha": 0.55, "pad": 1},
+    )
+
+
+def display_limits(image: np.ndarray) -> tuple[float, float]:
+    low, high = np.percentile(image, [0.5, 99.5])
+    if high <= low:
+        low, high = float(image.min()), float(image.max())
+    return float(low), float(high)
+
+
+def visualize_sanet_output(
+    sanet_dir: str | Path,
+    case_pid: int,
+    nodule_id: int | None = None,
+    output: str | Path | None = None,
+) -> Path:
     sanet_dir = Path(sanet_dir)
-    full_dir = sanet_dir / "full"
-    anno_csv = sanet_dir / "split" / "all_anno.csv"
-    
-    # 加载标注
-    ann = pd.read_csv(anno_csv)
-    print(f"加载标注文件: {anno_csv}")
-    print(f"总共 {len(ann)} 个结节标注")
-    print(f"标注列: {list(ann.columns)}")
-    print(ann.head())
-    
-    # 选择病例
-    if case_pid is None:
-        # 随机选择一个有标注的病例
-        case_pid = ann['pid'].iloc[0]
-        print(f"\n自动选择病例 PID={case_pid}")
-    
-    # 加载npy文件
-    npy_file = full_dir / f"{case_pid:05d}_zoom.npy"
-    if not npy_file.exists():
-        print(f"错误: 找不到文件 {npy_file}")
-        return
-    
-    volume = np.load(npy_file)
-    print(f"\n加载病例: {npy_file}")
-    print(f"Volume shape: {volume.shape} (应为 [1, D, H, W])")
-    print(f"Value range: [{volume.min():.1f}, {volume.max():.1f}]")
-    
-    # 获取该病例的所有结节
-    case_ann = ann[ann['pid'] == case_pid]
-    print(f"\n病例 {case_pid} 有 {len(case_ann)} 个结节")
-    print(case_ann)
-    
-    # 选择切片
-    if slice_idx is None:
-        # 选择第一个结节的中心切片
-        first_nodule = case_ann.iloc[0]
-        slice_idx = int((first_nodule['zmin'] + first_nodule['zmax']) / 2)
-        print(f"\n自动选择切片 idx={slice_idx} (结节中心)")
-    
-    if slice_idx >= volume.shape[1]:
-        print(f"错误: 切片索引 {slice_idx} 超出范围 [0, {volume.shape[1]-1}]")
-        return
-    
-    # 获取切片图像
-    img = volume[0, slice_idx]  # [H, W]
-    
-    # 找出该切片上的所有结节
-    slice_nodules = case_ann[(case_ann['zmin'] <= slice_idx) & (case_ann['zmax'] >= slice_idx)]
-    print(f"\n切片 {slice_idx} 上有 {len(slice_nodules)} 个结节")
-    
-    # 可视化
-    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-    ax.imshow(img, cmap='gray')
-    
-    # 绘制结节边界框
-    colors = ['red', 'green', 'blue', 'yellow', 'cyan', 'magenta', 'orange', 'lime', 'pink', 'purple']
-    for idx, (_, nodule) in enumerate(slice_nodules.iterrows()):
-        color = colors[idx % len(colors)]
-        xmin, xmax = int(nodule['xmin']), int(nodule['xmax'])
-        ymin, ymax = int(nodule['ymin']), int(nodule['ymax'])
-        nodule_id = int(nodule['nodule_id'])
-        
-        # 绘制矩形框
-        rect = plt.Rectangle((xmin, ymin), xmax - xmin, ymax - ymin,
-                            fill=False, edgecolor=color, linewidth=2)
-        ax.add_patch(rect)
-        
-        # 标注结节ID
-        ax.text(xmin, ymin - 5, f'Nodule {nodule_id}', 
-                color=color, fontsize=12, fontweight='bold',
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
-        
-        print(f"  结节 {nodule_id}: z[{int(nodule['zmin'])}-{int(nodule['zmax'])}], "
-              f"x[{xmin}-{xmax}], y[{ymin}-{ymax}]")
-    
-    ax.set_title(f'PID={case_pid}, Slice={slice_idx}, '
-                f'{len(slice_nodules)} nodule(s) in this slice',
-                fontsize=14, fontweight='bold')
-    ax.axis('off')
-    plt.tight_layout()
-    plt.show()
-    
-    # 显示结节在Z轴的分布
-    if len(case_ann) > 1:
-        fig, ax = plt.subplots(1, 1, figsize=(10, 4))
-        for idx, (_, nodule) in enumerate(case_ann.iterrows()):
-            color = colors[int(nodule['nodule_id']) % len(colors)]
-            ax.plot([nodule['zmin'], nodule['zmax']], 
-                   [int(nodule['nodule_id']), int(nodule['nodule_id'])],
-                   color=color, linewidth=3, marker='o', markersize=8)
-            ax.text(nodule['zmin'], int(nodule['nodule_id']) + 0.1,
-                   f'Nodule {int(nodule["nodule_id"])}', 
-                   color=color, fontweight='bold')
-        
-        ax.set_xlabel('Z-axis (slice index)', fontsize=12)
-        ax.set_ylabel('Nodule ID', fontsize=12)
-        ax.set_title(f'PID={case_pid}: Nodule distribution along Z-axis', fontsize=14)
-        ax.set_yticks(range(len(case_ann)))
-        ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.show()
+    annotations = load_annotations(sanet_dir)
+    annotation = select_annotation(annotations, case_pid, nodule_id)
+
+    candidate_paths = [
+        sanet_dir / "full" / f"{normalize_pid(case_pid, width)}_zoom.npy"
+        for width in [5, 6]
+    ]
+    volume_path = next((path for path in candidate_paths if path.exists()), None)
+    if volume_path is None:
+        raise FileNotFoundError(
+            "Cannot find volume. Tried: " + ", ".join(map(str, candidate_paths))
+        )
+    volume = load_volume(volume_path)
+
+    zmin, zmax = int(annotation.zmin), int(annotation.zmax)
+    ymin, ymax = int(annotation.ymin), int(annotation.ymax)
+    xmin, xmax = int(annotation.xmin), int(annotation.xmax)
+    z = (zmin + zmax) // 2
+    y = (ymin + ymax) // 2
+    x = (xmin + xmax) // 2
+
+    if not (0 <= z < volume.shape[0] and 0 <= y < volume.shape[1] and 0 <= x < volume.shape[2]):
+        raise ValueError(
+            f"Box center {(z, y, x)} is outside volume shape {volume.shape}"
+        )
+
+    views = [
+        ("Axial", volume[z], (xmin, ymin), xmax - xmin + 1, ymax - ymin + 1),
+        ("Coronal", volume[:, y, :], (xmin, zmin), xmax - xmin + 1, zmax - zmin + 1),
+        ("Sagittal", volume[:, :, x], (ymin, zmin), ymax - ymin + 1, zmax - zmin + 1),
+    ]
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    label = f"GT {int(annotation.nodule_id)}"
+    for ax, (title, image, xy, width, height) in zip(axes, views):
+        vmin, vmax = display_limits(image)
+        ax.imshow(image, cmap="gray", origin="upper", vmin=vmin, vmax=vmax)
+        add_box(ax, xy, width, height, label)
+        ax.set_title(title)
+        ax.axis("off")
+
+    fig.suptitle(
+        f"PID={normalize_pid(case_pid)}, nodule={int(annotation.nodule_id)}, "
+        f"center zyx=({z},{y},{x}), volume={volume.shape}"
+    )
+    fig.tight_layout()
+
+    output_path = (
+        Path(output)
+        if output
+        else sanet_dir
+        / "visualizations"
+        / f"{normalize_pid(case_pid)}_nodule_{int(annotation.nodule_id)}.png"
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"Volume: {volume_path}")
+    print(f"Shape: {volume.shape}, range: [{volume.min():.3f}, {volume.max():.3f}]")
+    print(f"Annotation: z[{zmin},{zmax}] y[{ymin},{ymax}] x[{xmin},{xmax}]")
+    print(f"Saved: {output_path}")
+    return output_path
 
 
-if __name__ == '__main__':
-    # 配置路径
-    SANET_DIR = '/data/医保大赛/code/SANet/data/LNDB'
-    
-    # 方式1: 随机选择一个病例可视化
-    visualize_sanet_output(SANET_DIR)
-    
-    # 方式2: 指定病例PID
-    # visualize_sanet_output(SANET_DIR, case_pid=24)
-    
-    # 方式3: 指定病例和切片
-    visualize_sanet_output(SANET_DIR, case_pid=1, slice_idx=260)
+def build_argparser():
+    parser = argparse.ArgumentParser(
+        description="Visualize a SANet-ready annotation in axial/coronal/sagittal views."
+    )
+    parser.add_argument(
+        "--sanet-dir",
+        default="/data/医保大赛/code/SANet/data/PN9",
+    )
+    parser.add_argument("--pid", type=int, default=9448)
+    parser.add_argument("--nodule-id", type=int, default=None,help="pid对应的病例的结节id，在split/all_anno_3D.csv中可以查看；不指定默认选择第一个")
+    parser.add_argument("--output", default=None,help="输出的PNG图片 path，默认在sanet_dir/visualizations目录下")
+    return parser
+
+
+if __name__ == "__main__":
+    args = build_argparser().parse_args()
+    visualize_sanet_output(
+        args.sanet_dir,
+        case_pid=args.pid,
+        nodule_id=args.nodule_id,
+        output=args.output,
+    )

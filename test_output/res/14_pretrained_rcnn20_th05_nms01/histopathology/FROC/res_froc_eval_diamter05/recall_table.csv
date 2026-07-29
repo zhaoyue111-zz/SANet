@@ -1,0 +1,2 @@
+dataset,recall@0.125/scan,recall@0.25/scan,recall@0.5/scan,recall@1/scan,recall@2/scan,recall@4/scan,recall@8/scan,recall@16/scan,recall@unlimited
+histopathology,0.333333,0.666667,0.916667,1.000000,1.000000,1.000000,1.000000,1.000000,1.000000

@@ -1,0 +1,19 @@
+{
+  "preprocessed_data_dir": "data/LNDB/full",
+  "train_set_list": "data/LNDB/split/train.txt",
+  "val_set_list": "data/LNDB/split/val.txt",
+  "test_set_name": "data/LNDB/split/test.txt",
+  "train_anno": "data/LNDB/split/train_anno.csv",
+  "test_anno": "data/LNDB/split/test_anno.csv",
+  "roi_names": [
+    "nodule"
+  ],
+  "num_class": 2,
+  "crop_size": [
+    128,
+    128,
+    128
+  ],
+  "bbox_border": 8,
+  "pad_value": 170
+}

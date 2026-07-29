@@ -1,0 +1,22 @@
+{
+  "dataset_name": "LNDb",
+  "num_cases": 192,
+  "num_boxes": 492,
+  "split_counts": {
+    "train": 134,
+    "val": 19,
+    "test": 39
+  },
+  "npy_format": "float32 [1,D,H,W], intensity [0,255]",
+  "spacing": "1mm x 1mm x 1mm",
+  "annotation_csv": [
+    "pid",
+    "zmin",
+    "zmax",
+    "ymin",
+    "ymax",
+    "xmin",
+    "xmax",
+    "nodule_id"
+  ]
+}

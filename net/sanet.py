@@ -1,20 +1,36 @@
+import os
 import sys
 
 from net.layer import *
 
 from config import net_config as config
 import copy
-from torch.nn.parallel.data_parallel import data_parallel
 import time
 import torch.nn.functional as F
 from utils.util import center_box_to_coord_box, ext2factor, clip_boxes
-from torch.nn.parallel import data_parallel
+from torch.nn.parallel import data_parallel as torch_data_parallel
 import random
 from scipy.stats import norm
 from net import resnet, cgnl
+import torch
+import torch.nn as nn
 
 bn_momentum = 0.1
 affine = True
+
+
+def data_parallel(module, inputs, *args, **kwargs):
+    if os.environ.get('SANET_DISABLE_INTERNAL_DATA_PARALLEL') == '1':
+        if isinstance(inputs, (tuple, list)):
+            return module(*inputs, **kwargs)
+        return module(inputs, **kwargs)
+    return torch_data_parallel(module, inputs, *args, **kwargs)
+
+
+def internal_parallel_size():
+    if os.environ.get('SANET_DISABLE_INTERNAL_DATA_PARALLEL') == '1':
+        return 1
+    return torch.cuda.device_count()
 
 class ResBlock3d(nn.Module):
     def __init__(self, n_in, n_out, stride = 1):
@@ -135,11 +151,11 @@ class RpnHead(nn.Module):
         size = logits.size()
         logits = logits.view(logits.size(0), logits.size(1), -1)
         logits = logits.transpose(1, 2).contiguous().view(size[0], size[2], size[3], size[4], len(config['anchors']), 1)
-        
+
         size = deltas.size()
         deltas = deltas.view(deltas.size(0), deltas.size(1), -1)
         deltas = deltas.transpose(1, 2).contiguous().view(size[0], size[2], size[3], size[4], len(config['anchors']), 6)
-        
+
 
         return logits, deltas
 
@@ -174,7 +190,7 @@ class MaskHead(nn.Module):
             nn.Conv3d(in_channels, 64, kernel_size=3, padding=1),
             nn.InstanceNorm3d(64, momentum=bn_momentum, affine=affine),
             nn.ReLU(inplace = True))
-        
+
         self.up2 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='trilinear'),
             nn.Conv3d(in_channels, 64, kernel_size=3, padding=1),
@@ -186,17 +202,17 @@ class MaskHead(nn.Module):
             nn.Conv3d(64, 64, kernel_size=3, padding=1),
             nn.InstanceNorm3d(64, momentum=bn_momentum, affine=affine),
             nn.ReLU(inplace = True))
-        
+
         self.back1 = nn.Sequential(
             nn.Conv3d(128, 64, kernel_size=3, padding=1),
             nn.InstanceNorm3d(64, momentum=bn_momentum, affine=affine),
             nn.ReLU(inplace = True))
-        
+
         self.back2 = nn.Sequential(
             nn.Conv3d(96, 64, kernel_size=3, padding=1),
             nn.InstanceNorm3d(64, momentum=bn_momentum, affine=affine),
             nn.ReLU(inplace = True))
-        
+
         self.back3 = nn.Sequential(
             nn.Conv3d(65, 64, kernel_size=3, padding=1),
             nn.InstanceNorm3d(64, momentum=bn_momentum, affine=affine),
@@ -206,9 +222,9 @@ class MaskHead(nn.Module):
             setattr(self, 'logits' + str(i + 1), nn.Conv3d(64, 1, kernel_size=1))
 
     def forward(self, detections, features):
-        img, f_2, f_4 = features  
+        img, f_2, f_4 = features
 
-        # Squeeze the first dimension to recover from protection on avoiding split by dataparallel      
+        # Squeeze the first dimension to recover from protection on avoiding split by dataparallel
         img = img.squeeze(0)
         f_2 = f_2.squeeze(0)
         f_4 = f_4.squeeze(0)
@@ -219,16 +235,16 @@ class MaskHead(nn.Module):
         for detection in detections:
             b, z_start, y_start, x_start, z_end, y_end, x_end, cat = detection
 
-            up1 = f_4[b, :, z_start / 4:z_end / 4, y_start / 4:y_end / 4, x_start / 4:x_end / 4].unsqueeze(0)
+            up1 = f_4[b, :, z_start // 4:z_end // 4, y_start // 4:y_end // 4, x_start // 4:x_end // 4].unsqueeze(0)
             up2 = self.up2(up1)
-            up2 = self.back2(torch.cat((up2, f_2[b, :, z_start / 2:z_end / 2, y_start / 2:y_end / 2, x_start / 2:x_end / 2].unsqueeze(0)), 1))
+            up2 = self.back2(torch.cat((up2, f_2[b, :, z_start // 2:z_end // 2, y_start // 2:y_end // 2, x_start // 2:x_end // 2].unsqueeze(0)), 1))
             up3 = self.up3(up2)
             im = img[b, :, z_start:z_end, y_start:y_end, x_start:x_end].unsqueeze(0)
             up3 = self.back3(torch.cat((up3, im), 1))
 
             logits = getattr(self, 'logits' + str(int(cat)))(up3)
             logits = logits.squeeze()
- 
+
             mask = Variable(torch.zeros((D, H, W))).cuda()
             mask[z_start:z_end, y_start:y_end, x_start:x_end] = logits
             mask = mask.unsqueeze(0)
@@ -245,7 +261,7 @@ def crop_mask_regions(masks, crop_boxes):
         b, z_start, y_start, x_start, z_end, y_end, x_end, cat = crop_boxes[i]
         m = masks[i][z_start:z_end, y_start:y_end, x_start:x_end].contiguous()
         out.append(m)
-    
+
     return out
 
 
@@ -255,7 +271,7 @@ def top1pred(boxes):
     for cat in pred_cats:
         preds = boxes[boxes[:, -1] == cat]
         res.append(preds[0])
-        
+
     res = np.array(res)
     return res
 
@@ -266,7 +282,7 @@ def random1pred(boxes):
         preds = boxes[boxes[:, -1] == cat]
         idx = random.sample(range(len(preds)), 1)[0]
         res.append(preds[idx])
-        
+
     res = np.array(res)
     return res
 
@@ -308,7 +324,9 @@ class CropRoi(nn.Module):
 
         crops = []
         for p in proposals:
-            b, z_start, y_start, x_start, z_end, y_end, x_end = p
+            b, z_start, y_start, x_start, z_end, y_end, x_end = (
+                int(value) for value in p.detach().cpu().tolist()
+            )
 
             # Slice 0 dim, should never happen
             c0 = np.array([z_start, y_start, x_start])
@@ -325,10 +343,10 @@ class CropRoi(nn.Module):
                 print('c0:', c0, ', c1:', c1)
             z_end, y_end, x_end = c1
 
-            fe1 = comb2[b, :, z_start / 4:z_end / 4, y_start / 4:y_end / 4, x_start / 4:x_end / 4].unsqueeze(0)
+            fe1 = comb2[b, :, z_start // 4:z_end // 4, y_start // 4:y_end // 4, x_start // 4:x_end // 4].unsqueeze(0)
             fe1_up = self.up2(fe1)
 
-            fe2 = self.back2(torch.cat((fe1_up, out1[b, :, z_start / 2:z_end / 2, y_start / 2:y_end / 2, x_start / 2:x_end / 2].unsqueeze(0)), 1))
+            fe2 = self.back2(torch.cat((fe1_up, out1[b, :, z_start // 2:z_end // 2, y_start // 2:y_end // 2, x_start // 2:x_end // 2].unsqueeze(0)), 1))
             # fe2_up = self.up3(fe2)
 
             # im = img[b, :, z_start / 2:z_end / 2, y_start / 2:y_end / 2, x_start / 2:x_end / 2].unsqueeze(0)
@@ -356,7 +374,7 @@ class SANet(nn.Module):
         self.rcnn_crop = CropRoi(self.cfg, cfg['rcnn_crop_size'])
         self.use_rcnn = False
         # self.rpn_loss = Loss(cfg['num_hard'])
-        
+
 
     def forward(self, inputs, truth_boxes, truth_labels, split_combiner=None, nzhw=None):
         # features, feat_4 = self.feature_net(inputs)
@@ -373,16 +391,18 @@ class SANet(nn.Module):
 
         self.rpn_window = make_rpn_windows(fs, self.cfg)
         self.rpn_proposals = []
+        self.raw_rpn_proposals = []
         if self.use_rcnn or self.mode in ['eval', 'test']:
             self.rpn_proposals = rpn_nms(self.cfg, self.mode, inputs, self.rpn_window,
                   self.rpn_logits_flat, self.rpn_deltas_flat)
+            self.raw_rpn_proposals = copy.deepcopy(self.rpn_proposals)
 
         if self.mode in ['train', 'valid']:
             # self.rpn_proposals = torch.zeros((0, 8)).cuda()
             self.rpn_labels, self.rpn_label_assigns, self.rpn_label_weights, self.rpn_targets, self.rpn_target_weights = \
                 make_rpn_target(self.cfg, self.mode, inputs, self.rpn_window, truth_boxes, truth_labels )
 
-            if self.use_rcnn:
+            if self.use_rcnn:  # RCNN target生成
                 # self.rpn_proposals = torch.zeros((0, 8)).cuda()
                 self.rpn_proposals, self.rcnn_labels, self.rcnn_assigns, self.rcnn_targets = \
                     make_rcnn_target(self.cfg, self.mode, inputs, self.rpn_proposals,
@@ -401,12 +421,12 @@ class SANet(nn.Module):
                 proposal[:, 1:] = ext2factor(proposal[:, 1:], 4)
                 proposal[:, 1:] = clip_boxes(proposal[:, 1:], inputs.shape[2:])
                 # rcnn_crops = self.rcnn_crop(features, inputs, torch.from_numpy(proposal).cuda())
-                features = [t.unsqueeze(0).expand(torch.cuda.device_count(), -1, -1, -1, -1, -1) for t in features]
+                features = [t.unsqueeze(0).expand(internal_parallel_size(), -1, -1, -1, -1, -1) for t in features]
                 rcnn_crops = data_parallel(self.rcnn_crop, (features, inputs, torch.from_numpy(proposal).cuda()))
                 # rcnn_crops = self.rcnn_crop(fs, inputs, self.rpn_proposals)
                 # self.rcnn_logits, self.rcnn_deltas = self.rcnn_head(rcnn_crops)
                 self.rcnn_logits, self.rcnn_deltas = data_parallel(self.rcnn_head, rcnn_crops)
-                self.detections, self.keeps = rcnn_nms(self.cfg, self.mode, inputs, self.rpn_proposals, 
+                self.detections, self.keeps = rcnn_nms(self.cfg, self.mode, inputs, self.rpn_proposals,
                                                                         self.rcnn_logits, self.rcnn_deltas)
 
                 if self.mode in ['eval']:
@@ -415,25 +435,34 @@ class SANet(nn.Module):
                                               self.rcnn_deltas)
                     if self.ensemble_proposals.shape[0] == fpr_res.shape[0]:
                         self.ensemble_proposals[:, 1] = (self.ensemble_proposals[:, 1] + fpr_res[:, 0]) / 2
+            else:
+                self.rcnn_logits = inputs.new_zeros((0, self.cfg['num_class']))
+                self.rcnn_deltas = inputs.new_zeros((0, self.cfg['num_class'] * 6))
+                self.keeps = []
+
+        ddp_outputs = [self.rpn_logits_flat, self.rpn_deltas_flat]
+        if self.use_rcnn and hasattr(self, 'rcnn_logits') and hasattr(self, 'rcnn_deltas'):
+            ddp_outputs.extend([self.rcnn_logits, self.rcnn_deltas])
+        return tuple(ddp_outputs)
 
     def loss(self, targets=None):
         cfg  = self.cfg
-    
+
         self.rcnn_cls_loss, self.rcnn_reg_loss = torch.zeros(1).cuda(), torch.zeros(1).cuda()
         rcnn_stats = None
-    
+
         self.rpn_cls_loss, self.rpn_reg_loss, rpn_stats = \
            rpn_loss( self.rpn_logits_flat, self.rpn_deltas_flat, self.rpn_labels,
             self.rpn_label_weights, self.rpn_targets, self.rpn_target_weights, self.cfg, mode=self.mode)
-    
+
         if self.use_rcnn:
             self.rcnn_cls_loss, self.rcnn_reg_loss, rcnn_stats = \
                 rcnn_loss(self.rcnn_logits, self.rcnn_deltas, self.rcnn_labels, self.rcnn_targets)
-    
+
         self.total_loss = self.rpn_cls_loss + self.rpn_reg_loss \
                           + self.rcnn_cls_loss +  self.rcnn_reg_loss
 
-    
+
         return self.total_loss, rpn_stats, rcnn_stats
 
     def set_mode(self, mode):
@@ -470,7 +499,7 @@ class SANet(nn.Module):
             else:
                 # Does not have anchor box
                 return detections
-        
+
         pred_cats = np.unique(detections[:, -1]).astype(np.uint8)
         for cat in pred_cats:
             if cat - 1 not in anchor_ids:
@@ -490,7 +519,7 @@ class SANet(nn.Module):
                         score[i] += prob
 
                 res.append(preds[score == score.max()][0])
-            
+
         res = np.array(res)
         return res
 
@@ -500,4 +529,3 @@ if __name__ == '__main__':
     input = torch.rand([2,1,304,384,384])
     input = Variable(input)
     net(input, None, None)
-

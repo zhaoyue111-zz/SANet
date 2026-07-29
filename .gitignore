@@ -1,2 +1,19 @@
 
 .idea/
+*.pt
+*.nii.gz
+*.npy
+*.npz
+*.pth
+*.csv
+train_output/
+test_output/
+
+# Medical image data
+data/*/full/*.npy
+
+# Generated FROC outputs
+train_hard_examples/per_dataset/*/FROC/*.csv
+
+# Generated hard-example files
+train_hard_examples/hard_fps*.csv

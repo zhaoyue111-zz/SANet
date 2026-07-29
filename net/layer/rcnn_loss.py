@@ -5,6 +5,10 @@ import torch.nn.functional as F
 
 def rcnn_loss(logits, deltas, labels, targets, deltas_sigma=1.0):
     batch_size, num_class   = logits.size(0),logits.size(1)
+    if batch_size == 0:
+        zero = logits.sum() * 0 + deltas.sum() * 0
+        confusion_matrix = np.zeros((num_class, num_class))
+        return zero, zero, [0, 0, 0, 0, 0, 0, confusion_matrix]
 
     # Weighted cross entropy for imbalance class distribution
     weight = torch.ones(num_class).cuda()
@@ -15,7 +19,7 @@ def rcnn_loss(logits, deltas, labels, targets, deltas_sigma=1.0):
         weight[i] = total / num_pos
 
     weight = weight / weight.sum()
-    rcnn_cls_loss = F.cross_entropy(logits, labels, weight=weight, size_average=True)
+    rcnn_cls_loss = F.cross_entropy(logits, labels, weight=weight, reduction='mean')
 
     # If multi-class classification, compute the confusion metric to understand the mistakes
     confusion_matrix = np.zeros((num_class, num_class))
@@ -26,6 +30,7 @@ def rcnn_loss(logits, deltas, labels, targets, deltas_sigma=1.0):
         confusion_matrix[labels.long().detach()[i].item()][cat[i].detach().item()] += 1
 
     num_pos = len(labels.nonzero())
+    reg_losses = [0, 0, 0, 0, 0, 0]
 
     if num_pos > 0:
         # one hot encode
@@ -44,7 +49,7 @@ def rcnn_loss(logits, deltas, labels, targets, deltas_sigma=1.0):
             rcnn_reg_loss += l
             reg_losses.append(l.data.item())
     else:
-        rcnn_reg_loss = Variable(torch.cuda.FloatTensor(1).zero_()).sum()
+        rcnn_reg_loss = deltas.sum() * 0
 
     return rcnn_cls_loss, rcnn_reg_loss, [reg_losses[0], reg_losses[1], reg_losses[2],
                                         reg_losses[3], reg_losses[4], reg_losses[5], confusion_matrix]

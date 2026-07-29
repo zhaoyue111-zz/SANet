@@ -1,0 +1,17 @@
+
+************************************************************
+CAD Analysis: results_froc_eval
+************************************************************
+
+Candidate detection results:
+    True positives: 132
+    False positives: 3477
+    False negatives: 6
+    True negatives: 0
+    Total number of candidates: 3917
+    Total number of nodules: 138
+    Ignored candidates on excluded nodules: 0
+    Ignored candidates which were double detections on a nodule: 309
+    Sensitivity: 0.956521739
+    Average number of candidates per scan: 32.371900826
+    Final FROC score: 0.804578943

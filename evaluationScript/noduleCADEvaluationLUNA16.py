@@ -1,6 +1,7 @@
 import os
 import math
 import sys
+import csv
 import matplotlib
 matplotlib.use('agg')
 import matplotlib.pyplot as plt
@@ -38,7 +39,7 @@ zmax_label = 'zmax'
 
 # plot settings
 FROC_minX = 0.125 # Mininum value of x-axis of FROC curve
-FROC_maxX = 8 # Maximum value of x-axis of FROC curve
+FROC_maxX = 32 # Maximum value of x-axis of FROC curve
 bLogPlot = True
 
 def generateBootstrapSet(scanToCandidatesDict, FROCImList):
@@ -140,6 +141,12 @@ def computeFROC(FROCGTList, FROCProbList, totalNumberOfImages, excludeList):
     numberOfDetectedLesions = sum(FROCGTList_local)
     totalNumberOfLesions = sum(FROCGTList)
     totalNumberOfCandidates = len(FROCProbList_local)
+    if totalNumberOfImages == 0 or totalNumberOfLesions == 0 or numberOfDetectedLesions == 0:
+        fps = np.asarray([0.0, FROC_maxX], dtype='float32')
+        sens = np.asarray([0.0, 0.0], dtype='float32')
+        thresholds = np.asarray([np.inf, -np.inf], dtype='float32')
+        return fps, sens, thresholds
+
     fpr, tpr, thresholds = skl_metrics.roc_curve(FROCGTList_local, FROCProbList_local)
     if sum(FROCGTList) == len(FROCGTList): # Handle border case when there are no false positives and ROC analysis give nan values.
       print("WARNING, this system has no false positives..")
@@ -233,6 +240,9 @@ def evaluateCAD(seriesUIDs, results_filename, outputDir, allNodules, CADSystemNa
     excludeList = []
     FROCtoNoduleMap = []
     ignoredCADMarksList = []
+    listTPs = []
+    listFPs = []
+    listFNs = []
 
     # -- loop over the cases
     for seriesuid in seriesUIDs:
@@ -303,19 +313,26 @@ def evaluateCAD(seriesUIDs, results_filename, outputDir, allNodules, CADSystemNa
                 if found == True:
                     # append the sample with the highest probability for the FROC analysis
                     maxProb = None
+                    finalCandidate = None
                     for idx in range(len(noduleMatches)):
                         candidate = noduleMatches[idx]
                         if (maxProb is None) or (float(candidate.CADprobability) > maxProb):
                             maxProb = float(candidate.CADprobability)
+                            finalCandidate = candidate
 
                     FROCGTList.append(1.0)
                     FROCProbList.append(float(maxProb))
                     FPDivisorList.append(seriesuid)
                     excludeList.append(False)
-                    FROCtoNoduleMap.append("%s,%s,%s,%s,%s,%.9f,%s,%.9f" % (seriesuid, noduleAnnot.id, noduleAnnot.coordX, noduleAnnot.coordY, noduleAnnot.coordZ, float(noduleAnnot.diameter_mm), str(candidate.id), float(candidate.CADprobability)))
+                    FROCtoNoduleMap.append("%s,%s,%s,%s,%s,%.9f,%s,%.9f" % (seriesuid, noduleAnnot.id, noduleAnnot.coordX, noduleAnnot.coordY, noduleAnnot.coordZ, float(noduleAnnot.diameter_mm), str(finalCandidate.id), float(finalCandidate.CADprobability)))
                     candTPs += 1
+                    if finalCandidate is not None:
+                        finalCandidate.seriesuid = seriesuid
+                        listTPs.append(finalCandidate)
                 else:
                     candFNs += 1
+                    noduleAnnot.seriesuid = seriesuid
+                    listFNs.append(noduleAnnot)
                     # append a positive sample with the lowest probability, such that this is added in the FROC analysis
                     FROCGTList.append(1.0)
                     FROCProbList.append(minProbValue)
@@ -327,6 +344,8 @@ def evaluateCAD(seriesUIDs, results_filename, outputDir, allNodules, CADSystemNa
         # add all false positives to the vectors
         for key, candidate3 in candidates2.items():
             candFPs += 1
+            candidate3.seriesuid = seriesuid
+            listFPs.append(candidate3)
             FROCGTList.append(0.0)
             FROCProbList.append(float(candidate3.CADprobability))
             FPDivisorList.append(seriesuid)
@@ -414,22 +433,45 @@ def evaluateCAD(seriesUIDs, results_filename, outputDir, allNodules, CADSystemNa
         plt.ylabel('Sensitivity')
         plt.legend(loc='lower right')
         plt.title('FROC performance - %s' % (CADSystemName))
-        
+
         if bLogPlot:
-            plt.xscale('log', basex=2)
+            plt.xscale('log', base=2)
             ax.xaxis.set_major_formatter(FixedFormatter([0.125,0.25,0.5,1,2,4,8]))
         
         # set your ticks manually
         ax.xaxis.set_ticks([0.125,0.25,0.5,1,2,4,8])
         # ax.yaxis.set_ticks(np.arange(0.5, 1, 0.1))
         ax.yaxis.set_ticks(np.arange(0, 1.1, 0.1))
-        plt.grid(b=True, which='both')
+        plt.grid(visible=True, which='both')
         plt.tight_layout()
 
         plt.savefig(os.path.join(outputDir, "froc_%s.png" % CADSystemName), bbox_inches=0, dpi=300)
 
+    def output_nodule_details_tocsv(nod_list, outputpath):
+        with open(outputpath + ".csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["seriesuid", "coordX", "coordY", "coordZ", "radius", "probability"])
+            for nod in nod_list:
+                diameter = float(nod.diameter_mm) if getattr(nod, "diameter_mm", "") != "" else 0.0
+                probability = getattr(nod, "CADprobability", "")
+                writer.writerow([
+                    getattr(nod, "seriesuid", ""),
+                    nod.coordX,
+                    nod.coordY,
+                    nod.coordZ,
+                    diameter / 2.0,
+                    probability,
+                ])
+
+    output_nodule_details_tocsv(listTPs, os.path.join(outputDir, "TPs"))
+    output_nodule_details_tocsv(listFPs, os.path.join(outputDir, "FPs"))
+    output_nodule_details_tocsv(listFNs, os.path.join(outputDir, "FNs"))
+
     def find_nearest(array,value):
-        idx = np.where((fps - value) == (fps - value)[(fps - value) >= 0].min())[0][-1]
+        candidates = np.where((array - value) >= 0)[0]
+        if len(candidates) == 0:
+            return len(array) - 1
+        idx = candidates[0]
         return idx
     thres = [0.125,0.25,0.5,1,2,4,8]
     sen = []

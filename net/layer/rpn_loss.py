@@ -1,6 +1,11 @@
 import torch
 import torch.nn.functional as F
-from torch import nn
+
+
+def safe_binary_cross_entropy(prob, label):
+    if prob.numel() == 0:
+        return prob.sum() * 0
+    return F.binary_cross_entropy(prob, label.float(), reduction='mean')
 
 
 def weighted_focal_loss_for_cross_entropy(logits, labels, weights, gamma=2.):
@@ -14,9 +19,8 @@ def weighted_focal_loss_for_cross_entropy(logits, labels, weights, gamma=2.):
     return loss.sum()
 
 def binary_cross_entropy_with_hard_negative_mining(logits, labels, weights, batch_size, num_hard=2):
-    classify_loss = nn.BCELoss()
     probs = torch.sigmoid(logits)[:, 0].view(-1, 1)
-    pos_idcs = labels[:, 0] == 1
+    pos_idcs = (labels[:, 0] == 1) & (weights[:, 0] != 0)
 
     pos_prob = probs[pos_idcs, 0]
     pos_labels = labels[pos_idcs, 0]
@@ -29,20 +33,23 @@ def binary_cross_entropy_with_hard_negative_mining(logits, labels, weights, batc
     neg_idcs = (labels[:, 0] == 0) & (weights[:, 0] != 0)
     neg_prob = probs[neg_idcs, 0]
     neg_labels = labels[neg_idcs, 0]
-    if num_hard > 0:
+    if num_hard > 0 and len(pos_prob) > 0:
         neg_prob, neg_labels = OHEM(neg_prob, neg_labels, num_hard * len(pos_prob))
 
     pos_correct = 0
     pos_total = 0
-    if len(pos_prob) > 0:
-        cls_loss = 0.5 * classify_loss(
-            pos_prob, pos_labels.float()) + 0.5 * classify_loss(
-            neg_prob, neg_labels.float())
+    losses = []
+    if pos_prob.numel() > 0:
+        losses.append(safe_binary_cross_entropy(pos_prob, pos_labels))
         pos_correct = (pos_prob >= 0.5).sum()
         pos_total = len(pos_prob)
+    if neg_prob.numel() > 0:
+        losses.append(safe_binary_cross_entropy(neg_prob, neg_labels))
+
+    if losses:
+        cls_loss = sum(losses) / len(losses)
     else:
-        cls_loss = 0.5 * classify_loss(
-            neg_prob, neg_labels.float())
+        cls_loss = logits.sum() * 0
 
 
     neg_correct = (neg_prob < 0.5).sum()
@@ -125,17 +132,22 @@ def rpn_loss(logits, deltas, labels, label_weights, targets, target_weights, cfg
     # Calculate regression
     deltas = deltas.view(batch_size, 6)
     targets = targets.view(batch_size, 6)
+    target_weights = target_weights.view(batch_size, 1)
 
-    index = (labels != 0).nonzero()[:,0]
+    index = ((labels != 0) & (target_weights != 0)).nonzero()[:,0]
     deltas  = deltas[index]
     targets = targets[index]
 
-    rpn_reg_loss = 0
-    reg_losses = []
-    for i in range(6):
-        l = F.smooth_l1_loss(deltas[:, i], targets[:, i])
-        rpn_reg_loss += l
-        reg_losses.append(l.data.item())
+    if len(index) == 0:
+        rpn_reg_loss = deltas.sum() * 0
+        reg_losses = [0.0] * 6
+    else:
+        rpn_reg_loss = 0
+        reg_losses = []
+        for i in range(6):
+            l = F.smooth_l1_loss(deltas[:, i], targets[:, i])
+            rpn_reg_loss += l
+            reg_losses.append(l.data.item())
 
     return rpn_cls_loss, rpn_reg_loss, [pos_correct, pos_total, neg_correct, neg_total,
                                         reg_losses[0], reg_losses[1], reg_losses[2],

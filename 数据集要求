@@ -1,0 +1,125 @@
+项目定位
+  这是一个三维肺结节检测项目 SANet，输入整套 CT 体数据，输出肺结节三维包围框。当
+  前代码实际是二分类检测：背景 / 结节，CSV 中的 9 种 nodule_class 不参与训练。
+
+  推荐目录结构
+
+  process_zoom/
+  ├── full/
+  │   ├── 00001_zoom.npy
+  │   ├── 00002_zoom.npy
+  │   └── ...
+  └── split_full_with_nodule_9classes/
+      ├── train.txt
+      ├── val.txt
+      ├── test.txt
+      ├── train_anno.csv
+      ├── test_anno.csv
+      └── test_anno_center.csv
+
+  然后修改 config.py:15 中的 BASE。
+
+  ### 1. CT 数据
+
+  每个病例对应一个文件：
+
+  {pid}_zoom.npy
+
+  例如列表中为：
+
+  00001
+  00002
+
+  则必须存在：
+
+  full/00001_zoom.npy
+  full/00002_zoom.npy
+
+  数组要求：
+
+  shape = [1, D, H, W]
+  轴顺序 = [通道, z, y, x]
+  强度范围 = [0, 255]
+
+  CT 应预先：
+
+  - 重采样到 1mm × 1mm × 1mm
+  - HU 截断到约 [-1200, 600]
+  - 映射为 [0, 255]
+
+  加载后代码会执行：
+
+  (image.astype(np.float32) - 128) / 128
+
+  当前有效实现仅加载 .npy；JPG 加载代码已被注释，不能直接使用。详见 dataset/
+  bbox_reader.py:90。
+
+  ### 2. 数据集列表
+
+  train.txt、val.txt、test.txt 每行一个病例 ID：
+
+  00001
+  00002
+  00015
+
+  要求：
+
+  - 不带 _zoom.npy
+  - 不带目录
+  - 不要有空行
+  - ID 必须能转换成整数，因为代码使用 int(fn) 匹配 CSV
+  - 当前实现最好保证每个病例至少有一个结节标注
+
+  ### 3. 训练标注 CSV
+
+  最低必需字段：
+
+  pid,xmin,xmax,ymin,ymax,zmin,zmax
+  1,74,87,243,253,94,99
+  2,270,274,224,228,228,229
+
+  代码实际转换顺序为：
+
+  [zmin, zmax, ymin, ymax, xmin, xmax]
+
+  坐标要求：
+
+  - 是重采样后 CT 数组的体素索引
+  - 不是原始 DICOM 世界坐标
+  - 与 .npy 的 (z,y,x) 方向完全一致
+  - 边界按闭区间处理，尺寸计算包含 +1
+
+  训练集和验证集都使用 train_anno.csv；测试使用 test_anno.csv，见 dataset/
+  bbox_reader.py:36。
+
+  CSV 可以包含额外字段，例如仓库样例：
+
+  pid,nodule_class,xmin,xmax,ymin,ymax,zmin,zmax,nodule_id
+
+  但 nodule_class 会被忽略，所有结节统一赋值为类别 1。
+
+  ### 4. FROC 评估标注
+
+  完整测试评估还需要：
+
+  pid,center_x,center_y,center_z,diameter
+
+  中心可由包围框计算：
+
+  center_x = (xmin + xmax) / 2
+  center_y = (ymin + ymax) / 2
+  center_z = (zmin + zmax) / 2
+  diameter = 最大方向尺寸
+
+  仓库提供了示例 data/test_anno_center.csv:1。
+
+  需要注意，test.py:141 中 FROC 标注路径和 test.txt 路径仍是硬编码的绝对路径，迁
+  移数据时必须一并修改。
+
+  结论
+  项目不能直接训练原始 DICOM。你需要先生成：
+
+  1. [1,D,H,W] 的 {pid}_zoom.npy
+  2. 每行一个 PID 的数据划分 TXT
+  3. 基于重采样后体素坐标的三维框 CSV
+  4. 测试时额外准备中心点和直径 CSV。

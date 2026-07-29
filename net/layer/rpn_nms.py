@@ -11,6 +11,10 @@ except ImportError:
     from utils.util import py_nms as torch_nms
     from utils.util import py_box_overlap as torch_overlap
 
+'''
+把大量 anchor 预测筛成少量候选框 proposals
+'''
+
 def make_rpn_windows(f, cfg):
     """
     Generating anchor boxes at each voxel on the feature map,
@@ -24,11 +28,13 @@ def make_rpn_windows(f, cfg):
     anchors = np.asarray(cfg['anchors'])
     offset = (float(stride) - 1) / 2
     _, _, D, H, W = f.shape
+    # # 在特征图每个位置生成中心点坐标
     oz = np.arange(offset, offset + stride * (D - 1) + 1, stride)
     oh = np.arange(offset, offset + stride * (H - 1) + 1, stride)
     ow = np.arange(offset, offset + stride * (W - 1) + 1, stride)
 
     windows = []
+    # # 每个中心点 × 5种anchor尺寸
     for z, y , x , a in itertools.product(oz, oh , ow , anchors):
         windows.append([z, y , x , a[0], a[1], a[2]])
     windows = np.array(windows)
@@ -39,10 +45,14 @@ def rpn_nms(cfg, mode, inputs, window, logits_flat, deltas_flat):
     if mode in ['train',]:
         nms_pre_score_threshold = cfg['rpn_train_nms_pre_score_threshold']
         nms_overlap_threshold   = cfg['rpn_train_nms_overlap_threshold']
+        nms_num = cfg.get('rpn_train_nms_num', 300)
+        pre_nms_top_n = cfg.get('rpn_train_pre_nms_top_n', 6000)
 
     elif mode in ['eval', 'valid', 'test',]:
         nms_pre_score_threshold = cfg['rpn_test_nms_pre_score_threshold']
         nms_overlap_threshold   = cfg['rpn_test_nms_overlap_threshold']
+        nms_num = cfg.get('rpn_test_nms_num', cfg.get('rpn_train_nms_num', 300))
+        pre_nms_top_n = cfg.get('rpn_test_pre_nms_top_n', 6000)
 
     else:
         raise ValueError('rpn_nms(): invalid mode = %s?'%mode)
@@ -63,6 +73,9 @@ def rpn_nms(cfg, mode, inputs, window, logits_flat, deltas_flat):
         # will be chosen for nms computation
         index = np.where(ps[:, 0] > nms_pre_score_threshold)[0]
         if len(index) > 0:
+            if pre_nms_top_n is not None and pre_nms_top_n > 0 and len(index) > pre_nms_top_n:
+                top = np.argsort(-ps[index, 0])[:pre_nms_top_n]
+                index = index[top]
             p = ps[index]
             d = ds[index]
             w = window[index]
@@ -73,6 +86,8 @@ def rpn_nms(cfg, mode, inputs, window, logits_flat, deltas_flat):
 
             output = torch.from_numpy(output)
             output, keep = torch_nms(output, nms_overlap_threshold)
+            if nms_num is not None and nms_num > 0 and len(output) > nms_num:
+                output = output[:nms_num]
 
             prop = np.zeros((len(output), 8),np.float32)
             prop[:, 0] = b
