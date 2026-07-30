@@ -83,6 +83,9 @@ net_config = {
     # region proposal network configuration
     'rpn_train_bg_thresh_high': 0.02,
     'rpn_train_fg_thresh_low': 0.5,
+    'rpn_train_adaptive_fg_thresh': False,
+    'rpn_train_small_gt_max_side': 10.0,
+    'rpn_train_small_gt_fg_thresh_low': 0.2,
 
     'rpn_train_nms_num': 300,
     'rpn_train_pre_nms_top_n': 6000,

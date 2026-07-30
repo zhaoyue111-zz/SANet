@@ -17,6 +17,20 @@ def _overlap_to_numpy(overlap):
     return overlap
 
 
+def rpn_gt_fg_thresholds(cfg, pos_truth_box):
+    base_thresh = float(cfg['rpn_train_fg_thresh_low'])
+    pos_truth_box = np.asarray(pos_truth_box, dtype=np.float32).reshape(-1, 6)
+    thresholds = np.full((len(pos_truth_box), ), base_thresh, np.float32)
+    if not bool(cfg.get('rpn_train_adaptive_fg_thresh', False)) or len(pos_truth_box) == 0:
+        return thresholds
+
+    small_max_side = float(cfg.get('rpn_train_small_gt_max_side', 10.0))
+    small_thresh = float(cfg.get('rpn_train_small_gt_fg_thresh_low', 0.2))
+    max_side = np.max(pos_truth_box[:, 3:6], axis=1)
+    thresholds[max_side < small_max_side] = small_thresh
+    return thresholds
+
+
 def assign_rpn_anchors(cfg, window, truth_box, truth_label):
     """
     Assign RPN anchors to valid GT boxes.
@@ -43,12 +57,14 @@ def assign_rpn_anchors(cfg, window, truth_box, truth_label):
 
         anchor_best_gt = np.argmax(overlap, 1)
         anchor_best_iou = overlap[np.arange(num_window), anchor_best_gt]
+        gt_fg_thresholds = rpn_gt_fg_thresholds(cfg, pos_truth_box)
+        anchor_fg_thresholds = gt_fg_thresholds[anchor_best_gt]
 
         bg_index = np.where(anchor_best_iou < cfg['rpn_train_bg_thresh_high'])[0]
         label[bg_index] = 0
         label_weight[bg_index] = 1
 
-        fg_index = np.where(anchor_best_iou >= cfg['rpn_train_fg_thresh_low'])[0]
+        fg_index = np.where(anchor_best_iou >= anchor_fg_thresholds)[0]
         label[fg_index] = 1
         label_weight[fg_index] = 1
         label_assign[fg_index] = anchor_best_gt[fg_index]
