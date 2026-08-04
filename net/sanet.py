@@ -460,6 +460,7 @@ class SANet(nn.Module):
 
         self.cfg = cfg
         self.mode = mode
+        self.loss_weights = cfg.get('loss_weights', (1.0, 1.0, 1.0, 1.0))
         self.feature_net = FeatureNet(config)
         self.rpn = RpnHead(config, in_channels=128)
         self.rcnn_head = RcnnHead(config, in_channels=64)
@@ -551,8 +552,8 @@ class SANet(nn.Module):
             self.rcnn_cls_loss, self.rcnn_reg_loss, rcnn_stats = \
                 rcnn_loss(self.rcnn_logits, self.rcnn_deltas, self.rcnn_labels, self.rcnn_targets)
 
-        self.total_loss = self.rpn_cls_loss + self.rpn_reg_loss \
-                          + self.rcnn_cls_loss +  self.rcnn_reg_loss
+        w_rpn_cls, w_rpn_reg, w_rcnn_cls, w_rcnn_reg = self.loss_weights
+        self.total_loss = w_rpn_cls * self.rpn_cls_loss + w_rpn_reg * self.rpn_reg_loss + w_rcnn_cls * self.rcnn_cls_loss + w_rcnn_reg * self.rcnn_reg_loss
 
 
         return self.total_loss, rpn_stats, rcnn_stats

@@ -575,6 +575,15 @@ def main():
         else:
             model.use_rcnn = False
 
+        if i < epoch_rcnn:
+            model.loss_weights = (1.0, 1.0, 0.0, 0.0)
+        elif i < epoch_rcnn + 10:
+            model.loss_weights = (2.0, 1.0, 0.25, 1.0)
+        else:
+            model.loss_weights = (2.0, 1.0, 0.5, 1.0)
+
+        print('[loss weights: rpn_cls %.2f, rpn_reg %.2f, rcnn_cls %.2f, rcnn_reg %.2f]' % model.loss_weights)
+
         print('[epoch %d, lr %f, use_rcnn: %r]' % (i, lr, model.use_rcnn))
         train(net, train_loader, optimizer, i, train_writer, args)
         val_summary = validate(net, val_loader, i, val_writer, args)
