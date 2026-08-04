@@ -259,10 +259,8 @@ parser.add_argument('--dataset', default=train_config['dataset'], type=str,
                     help="dataset name under data/, or 'all' for all SANet-ready datasets")
 parser.add_argument('--resume', action='store_true',
                     help='resume epoch and optimizer from checkpoint instead of using it as pretrained weights')
-parser.add_argument('--hard-fp-csv', default="/mnt/afs2/code/SANet/train_hard_examples/hard_fps.csv", type=str,
-                    help='CSV of mined false positives used as hard negative patch centers for training.')
-parser.add_argument('--hard-fn-csv', default="/mnt/afs2/code/SANet/train_hard_examples/hard_fns.csv", type=str,
-                    help='CSV of mined false negatives used as extra positive patch centers for training.')
+parser.add_argument('--hard-fp-csv', nargs='+', type=str, default=None, help='One or more hard FP CSV files.')
+parser.add_argument('--hard-fn-csv', nargs='+', type=str, default=None, help='One or more hard FN CSV files.')
 parser.add_argument('--hard-fp-threshold', default=0.9, type=float,
                     help='Minimum FP probability used by --hard-fp-csv. Default: 0.9.')
 parser.add_argument('--train-neg-pos-ratio', default=net_config.get('train_neg_pos_ratio', 1.0), type=float,

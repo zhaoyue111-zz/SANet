@@ -15,6 +15,12 @@ try:
 except ImportError:
     nrrd = None
 
+def _normalize_csv_paths(csv_paths):
+    if csv_paths is None:
+        return []
+    if isinstance(csv_paths, (str, os.PathLike)):
+        return [os.fspath(csv_paths)]
+    return [os.fspath(path) for path in csv_paths if path]
 
 def _pid_keys(value):
     pid = str(value).strip()
@@ -34,96 +40,93 @@ def _row_dataset_matches(row, dataset_name):
     return str(row['dataset']) == str(dataset_name)
 
 
-def _load_hard_fns(csv_path, dataset_name, filename_to_idx):
-    if not csv_path:
-        return []
-    if not os.path.isfile(csv_path):
-        raise FileNotFoundError("Hard FN csv not found: %s" % csv_path)
-
-    df = pd.read_csv(csv_path)
-    required_box = {'pid', 'zmin', 'zmax', 'ymin', 'ymax', 'xmin', 'xmax'}
-    required_center = {'pid', 'center_x', 'center_y', 'center_z', 'diameter'}
-    if not required_box.issubset(df.columns) and not required_center.issubset(df.columns):
-        raise ValueError(
-            "Hard FN csv %s must contain either bbox columns %s or center columns %s"
-            % (csv_path, sorted(required_box), sorted(required_center))
-        )
-
+def _load_hard_fns(csv_paths, dataset_name, filename_to_idx):
+    csv_paths = _normalize_csv_paths(csv_paths)
     samples = []
-    for _, row in df.iterrows():
-        if not _row_dataset_matches(row, dataset_name):
-            continue
-        idx = None
-        for key in _pid_keys(row['pid']):
-            if key in filename_to_idx:
-                idx = filename_to_idx[key]
-                break
-        if idx is None:
-            continue
 
-        if required_box.issubset(df.columns):
-            box = [
-                row['zmin'], row['zmax'],
-                row['ymin'], row['ymax'],
-                row['xmin'], row['xmax'],
-            ]
-        else:
-            radius = float(row['diameter']) / 2.0
-            box = [
-                float(row['center_z']) - radius, float(row['center_z']) + radius,
-                float(row['center_y']) - radius, float(row['center_y']) + radius,
-                float(row['center_x']) - radius, float(row['center_x']) + radius,
-            ]
-        box = np.asarray(box, dtype=np.float32)
-        if not np.isfinite(box).all():
-            continue
-        if not (box[1] >= box[0] and box[3] > box[2] and box[5] > box[4]):
-            continue
-        samples.append(np.concatenate([[idx], box]))
+    for csv_path in csv_paths:
+        if not os.path.isfile(csv_path):
+            raise FileNotFoundError("Hard FN csv not found: %s" % csv_path)
+
+        df = pd.read_csv(csv_path)
+        required_box = {'pid', 'zmin', 'zmax', 'ymin', 'ymax', 'xmin', 'xmax'}
+        required_center = {'pid', 'center_x', 'center_y', 'center_z', 'diameter'}
+        has_box = required_box.issubset(df.columns)
+        has_center = required_center.issubset(df.columns)
+
+        if not has_box and not has_center:
+            raise ValueError("Hard FN csv %s must contain either bbox columns %s or center columns %s" % (csv_path, sorted(required_box), sorted(required_center)))
+
+        for _, row in df.iterrows():
+            if not _row_dataset_matches(row, dataset_name):
+                continue
+
+            idx = None
+            for key in _pid_keys(row['pid']):
+                if key in filename_to_idx:
+                    idx = filename_to_idx[key]
+                    break
+
+            if idx is None:
+                continue
+
+            if has_box:
+                box = [row['zmin'], row['zmax'], row['ymin'], row['ymax'], row['xmin'], row['xmax']]
+            else:
+                radius = float(row['diameter']) / 2.0
+                box = [float(row['center_z']) - radius, float(row['center_z']) + radius, float(row['center_y']) - radius, float(row['center_y']) + radius, float(row['center_x']) - radius, float(row['center_x']) + radius]
+
+            box = np.asarray(box, dtype=np.float32)
+
+            if not np.isfinite(box).all():
+                continue
+            if not (box[1] >= box[0] and box[3] > box[2] and box[5] > box[4]):
+                continue
+
+            samples.append(np.concatenate([[idx], box]).astype(np.float32))
+
     return samples
 
 
-def _load_hard_fps(csv_path, dataset_name, filename_to_idx, probability_threshold):
-    if not csv_path:
-        return []
-    if not os.path.isfile(csv_path):
-        raise FileNotFoundError("Hard FP csv not found: %s" % csv_path)
-
-    df = pd.read_csv(csv_path)
-    required = {'pid', 'center_x', 'center_y', 'center_z', 'probability'}
-    missing = required.difference(df.columns)
-    if missing:
-        raise ValueError("Hard FP csv %s is missing columns: %s" % (csv_path, sorted(missing)))
-
+def _load_hard_fps(csv_paths, dataset_name, filename_to_idx, probability_threshold):
+    csv_paths = _normalize_csv_paths(csv_paths)
     samples = []
-    for _, row in df.iterrows():
-        if not _row_dataset_matches(row, dataset_name):
-            continue
-        prob = float(row['probability'])
-        if prob < probability_threshold:
-            continue
-        idx = None
-        for key in _pid_keys(row['pid']):
-            if key in filename_to_idx:
-                idx = filename_to_idx[key]
-                break
-        if idx is None:
-            continue
 
-        diameter = float(row['diameter']) if 'diameter' in row.index and pd.notna(row['diameter']) else 0.0
-        sample = np.asarray([
-            idx,
-            float(row['center_z']),
-            float(row['center_y']),
-            float(row['center_x']),
-            diameter,
-            prob,
-        ], dtype=np.float32)
-        if not np.isfinite(sample).all():
-            continue
-        samples.append(sample)
+    for csv_path in csv_paths:
+        if not os.path.isfile(csv_path):
+            raise FileNotFoundError("Hard FP csv not found: %s" % csv_path)
+
+        df = pd.read_csv(csv_path)
+        required = {'pid', 'center_x', 'center_y', 'center_z', 'probability'}
+        missing = required.difference(df.columns)
+
+        if missing:
+            raise ValueError("Hard FP csv %s is missing columns: %s" % (csv_path, sorted(missing)))
+
+        for _, row in df.iterrows():
+            if not _row_dataset_matches(row, dataset_name):
+                continue
+
+            prob = float(row['probability'])
+            if not np.isfinite(prob) or prob < probability_threshold:
+                continue
+
+            idx = None
+            for key in _pid_keys(row['pid']):
+                if key in filename_to_idx:
+                    idx = filename_to_idx[key]
+                    break
+
+            if idx is None:
+                continue
+
+            diameter = float(row['diameter']) if 'diameter' in row.index and pd.notna(row['diameter']) else 0.0
+            sample = np.asarray([idx, float(row['center_z']), float(row['center_y']), float(row['center_x']), diameter, prob], dtype=np.float32)
+
+            if np.isfinite(sample).all():
+                samples.append(sample)
+
     return samples
-
 class BboxReader(Dataset):
     def __init__(self, data_dir, set_name, cfg, mode='train'):
         self.mode = mode
