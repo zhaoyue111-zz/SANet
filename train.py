@@ -522,7 +522,17 @@ def main():
         )
 
     optimizer_cls = getattr(torch.optim, optimizer)
-    optimizer = optimizer_cls(unwrap_model(net).parameters(), lr=init_lr, weight_decay=weight_decay, momentum=momentum)
+    model = unwrap_model(net)
+
+    rcnn_params = list(model.rcnn_crop.parameters()) + list(model.rcnn_head.parameters())
+    rcnn_param_ids = {id(p) for p in rcnn_params}
+    base_params = [p for p in model.parameters() if id(p) not in rcnn_param_ids]
+
+    optimizer = optimizer_cls([
+        {'params': base_params, 'lr': init_lr, 'name': 'base'},
+        {'params': rcnn_params, 'lr': 0.0, 'name': 'rcnn'},
+    ], weight_decay=weight_decay, momentum=momentum)
+
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
         optimizer_to_device(optimizer, args.device)
@@ -563,11 +573,30 @@ def main():
             train_sampler.set_epoch(i)
         # learning rate schedule
         if isinstance(optimizer, torch.optim.SGD):
-            lr = lr_schdule(i, init_lr=init_lr, total=epochs)
+            base_lr = lr_schdule(i, init_lr=init_lr, total=epochs)
+
+            rcnn_warmup_epochs = 10
+            rcnn_lr_scale = 0.1
+            rcnn_target_lr = base_lr * rcnn_lr_scale
+
+            if i < epoch_rcnn:
+                rcnn_lr = 0.0
+            elif i < epoch_rcnn + rcnn_warmup_epochs:
+                warmup_progress = float(i - epoch_rcnn + 1) / float(rcnn_warmup_epochs)
+                rcnn_lr = rcnn_target_lr * warmup_progress
+            else:
+                rcnn_lr = rcnn_target_lr
+
             for param_group in optimizer.param_groups:
-                param_group['lr'] = lr
+                if param_group.get('name') == 'rcnn':
+                    param_group['lr'] = rcnn_lr
+                else:
+                    param_group['lr'] = base_lr
         else:
-            lr = np.inf
+            base_lr = optimizer.param_groups[0]['lr']
+            rcnn_lr = optimizer.param_groups[1]['lr']
+
+        lr = base_lr
 
         model = unwrap_model(net)
         if i >= epoch_rcnn:
@@ -584,7 +613,7 @@ def main():
 
         print('[loss weights: rpn_cls %.2f, rpn_reg %.2f, rcnn_cls %.2f, rcnn_reg %.2f]' % model.loss_weights)
 
-        print('[epoch %d, lr %f, use_rcnn: %r]' % (i, lr, model.use_rcnn))
+        print('[epoch %d, base_lr %.6f, rcnn_lr %.6f, use_rcnn: %r]' % (i, base_lr, rcnn_lr, model.use_rcnn))
         train(net, train_loader, optimizer, i, train_writer, args)
         val_summary = validate(net, val_loader, i, val_writer, args)
         val_loss = distributed_mean(val_summary['loss'], args)
