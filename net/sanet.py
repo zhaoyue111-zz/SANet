@@ -9,11 +9,19 @@ import time
 import torch.nn.functional as F
 from utils.util import center_box_to_coord_box, ext2factor, clip_boxes
 from torch.nn.parallel import data_parallel as torch_data_parallel
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 import random
 from scipy.stats import norm
 from net import resnet, cgnl
 import torch
 import torch.nn as nn
+
+
+def _gradient_checkpoint(fn, *args):
+    try:
+        return _torch_checkpoint(fn, *args, use_reentrant=False)
+    except TypeError:
+        return _torch_checkpoint(fn, *args)
 
 bn_momentum = 0.1
 affine = True
@@ -121,17 +129,71 @@ class FeatureNet(nn.Module):
             nn.ReLU(inplace=True))
 
     def forward(self, x):
-        x1, out1, out2, out3, out4 = self.resnet50(x)
+        x1, out1, out2, out3, out4 = self.resnet50(x) # x:[B, 1, 128, 128, 128]
+        # x1:[B, 64, 64, 64, 64]
+        # out1:[B, 64, 64, 64, 64]
+        # out2:[B, 64, 32, 32, 32]
+        # out3:[B, 64, 16, 16, 16]
+        # out4:[B, 64, 8, 8, 8]
 
-        out4 = self.reduce1(out4)
-        rev3 = self.path1(out4)
-        out3 = self.reduce2(out3)
-        comb3 = self.back3(torch.cat((rev3, out3), 1))
-        rev2 = self.path2(comb3)
-        out2 = self.reduce3(out2)
-        comb2 = self.back2(torch.cat((rev2, out2), 1))
+        out4 = self.reduce1(out4) # [B, 64, 8, 8, 8]
+        rev3 = self.path1(out4) # [B, 64, 16, 16, 16]
+        out3 = self.reduce2(out3) # [B, 64, 16, 16, 16]
+        comb3 = self.back3(torch.cat((rev3, out3), 1))  # [B, 64, 16, 16, 16]
+        rev2 = self.path2(comb3) # [B, 64, 32, 32, 32]
+        out2 = self.reduce3(out2) # [B, 64, 32, 32, 32]
+        comb2 = self.back2(torch.cat((rev2, out2), 1)) # [B, 128, 32, 32, 32]
 
         return [x1, out1, comb2], out1
+
+class ASPP3D(nn.Module):
+    """
+    Lightweight 3D ASPP for SANet RPN.
+    """
+
+    def __init__(self,in_channels=128,out_channels=64,dilations=(1, 2, 3),):
+        super(ASPP3D, self).__init__()
+
+        # 4 branches: 1x1x1 + three 3x3x3 dilated convolutions.
+        num_branches = 1 + len(dilations)
+
+        if out_channels % num_branches != 0:
+            raise ValueError(f"out_channels must be divisible by the number of ASPP branches: {out_channels} % {num_branches} != 0")
+
+        branch_channels = out_channels // num_branches
+
+        self.branches = nn.ModuleList()
+
+        # Local channel projection branch.
+        self.branches.append(
+            nn.Sequential(
+                nn.Conv3d(in_channels,branch_channels,kernel_size=1,bias=False,),
+                nn.GroupNorm(num_groups=4,num_channels=branch_channels,),
+                nn.ReLU(inplace=True),
+            )
+        )
+
+        # Dilated spatial branches.
+        for dilation in dilations:
+            self.branches.append(
+                nn.Sequential(
+                    nn.Conv3d(in_channels,branch_channels,kernel_size=3,padding=dilation,dilation=dilation,bias=False,),
+                    nn.GroupNorm(num_groups=4,num_channels=branch_channels,),
+                    nn.ReLU(inplace=True),
+                )
+            )
+
+        # Fuse concatenated multi-scale features.
+        self.project = nn.Sequential(
+            nn.Conv3d(in_channels,branch_channels,kernel_size=1,bias=False,),
+            nn.GroupNorm(num_groups=8,num_channels=out_channels,),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        features = [branch(x) for branch in self.branches]
+        x = torch.cat(features, dim=1)
+        return self.project(x)
 
 class RpnHead(nn.Module):
     def __init__(self, config, in_channels=128):
@@ -139,12 +201,17 @@ class RpnHead(nn.Module):
         self.drop = nn.Dropout3d(p=0.5, inplace=False)
         self.conv = nn.Sequential(nn.Conv3d(in_channels, 64, kernel_size=1),
                                     nn.ReLU())
+        self.aspp = ASPP3D(in_channels=in_channels,out_channels=64,dilations=(1, 2, 3),)
+        self.aspp_weight = nn.Parameter(torch.zeros(1))
+
         self.logits = nn.Conv3d(64, 1 * len(config['anchors']), kernel_size=1)
         self.deltas = nn.Conv3d(64, 6 * len(config['anchors']), kernel_size=1)
 
     def forward(self, f):
         # out = self.drop(f)
-        out = self.conv(f)
+        base = self.conv(f)
+        context = self.aspp(f)
+        out = base + self.aspp_weight * context
 
         logits = self.logits(out)
         deltas = self.deltas(out)
@@ -225,9 +292,16 @@ class MaskHead(nn.Module):
         img, f_2, f_4 = features
 
         # Squeeze the first dimension to recover from protection on avoiding split by dataparallel
-        img = img.squeeze(0)
-        f_2 = f_2.squeeze(0)
-        f_4 = f_4.squeeze(0)
+        # img = img.squeeze(0)
+        # f_2 = f_2.squeeze(0)
+        # f_4 = f_4.squeeze(0)
+        def _unwrap_if_6d(t):
+            if t.dim() == 6:
+                return t.squeeze(0)
+            return t
+        img = _unwrap_if_6d(img)
+        f_2 = _unwrap_if_6d(f_2)
+        f_4 = _unwrap_if_6d(f_4)
 
         _, _, D, H, W = img.shape
         out = []
@@ -318,48 +392,66 @@ class CropRoi(nn.Module):
         img, out1, comb2 = f
         self.DEPTH, self.HEIGHT, self.WIDTH = inputs.shape[2:]
 
-        img = img.squeeze(0)
-        out1 = out1.squeeze(0)
-        comb2 = comb2.squeeze(0)
+        def _unwrap_if_6d(t):
+            if t.dim() == 6:
+                return t.squeeze(0)
+            return t
+        img = _unwrap_if_6d(img)
+        out1 = _unwrap_if_6d(out1)
+        comb2 = _unwrap_if_6d(comb2)
 
+        up2 = self.up2
+        back2 = self.back2
+        rcnn_crop_size = self.rcnn_crop_size
+        use_cp = self.training and comb2.requires_grad
+
+        def _crop_and_process(_comb2, _out1, _b, _zs, _ys, _xs, _ze, _ye, _xe):
+            _fe1 = _comb2[_b, :, _zs // 4:_ze // 4, _ys // 4:_ye // 4, _xs // 4:_xe // 4].unsqueeze(0)
+            _fe1_up = up2(_fe1)
+            _out1_slice = _out1[_b, :, _zs // 2:_ze // 2, _ys // 2:_ye // 2, _xs // 2:_xe // 2].unsqueeze(0)
+            _fe2 = back2(torch.cat((_fe1_up, _out1_slice), 1))
+            _crop = _fe2.squeeze(0)
+            _crop = F.adaptive_max_pool3d(_crop, rcnn_crop_size)
+            return _crop
+
+        CHUNK_SIZE = 32
         crops = []
-        for p in proposals:
-            b, z_start, y_start, x_start, z_end, y_end, x_end = (
-                int(value) for value in p.detach().cpu().tolist()
-            )
+        num_proposals = len(proposals)
 
-            # Slice 0 dim, should never happen
-            c0 = np.array([z_start, y_start, x_start])
-            c1 = np.array([z_end, y_end, x_end])
-            if np.any((c1 - c0) < 1): #np.any((c1 - c0).cpu().data.numpy() < 1):
-                # c0=c0+1
-                # c1=c1+1
+        for chunk_start in range(0, num_proposals, CHUNK_SIZE):
+            chunk_end = min(chunk_start + CHUNK_SIZE, num_proposals)
+            chunk_proposals = proposals[chunk_start:chunk_end]
+            chunk_crops = []
+
+            for p in chunk_proposals:
+                coords = [int(v) for v in p.detach().cpu().tolist()]
+                b, z_start, y_start, x_start, z_end, y_end, x_end = coords
+
+                c0 = (z_start, y_start, x_start)
+                c1 = [z_end, y_end, x_end]
                 for i in range(3):
-                    if c1[i] == 0:
+                    if c1[i] == 0 or c1[i] - c0[i] == 0:
                         c1[i] = c1[i] + 4
-                    if c1[i] - c0[i] == 0:
-                        c1[i] = c1[i] + 4
-                print(p)
-                print('c0:', c0, ', c1:', c1)
-            z_end, y_end, x_end = c1
+                z_end, y_end, x_end = c1
 
-            fe1 = comb2[b, :, z_start // 4:z_end // 4, y_start // 4:y_end // 4, x_start // 4:x_end // 4].unsqueeze(0)
-            fe1_up = self.up2(fe1)
+                if use_cp:
+                    crop = _gradient_checkpoint(
+                        _crop_and_process,
+                        comb2, out1,
+                        b, z_start, y_start, x_start, z_end, y_end, x_end,
+                    )
+                else:
+                    crop = _crop_and_process(
+                        comb2, out1,
+                        b, z_start, y_start, x_start, z_end, y_end, x_end,
+                    )
+                chunk_crops.append(crop)
+                del p, coords
 
-            fe2 = self.back2(torch.cat((fe1_up, out1[b, :, z_start // 2:z_end // 2, y_start // 2:y_end // 2, x_start // 2:x_end // 2].unsqueeze(0)), 1))
-            # fe2_up = self.up3(fe2)
+            crops.append(torch.stack(chunk_crops))
+            del chunk_crops, chunk_proposals
 
-            # im = img[b, :, z_start / 2:z_end / 2, y_start / 2:y_end / 2, x_start / 2:x_end / 2].unsqueeze(0)
-            # up3 = self.back3(torch.cat((fe2, im), 1))
-            # crop = up3.squeeze()
-
-            crop = fe2.squeeze()
-            # crop = f[b, :, c0[0]:c1[0], c0[1]:c1[1], c0[2]:c1[2]]
-            crop = F.adaptive_max_pool3d(crop, self.rcnn_crop_size)
-            crops.append(crop)
-
-        crops = torch.stack(crops)
-
+        crops = torch.cat(crops, dim=0)
         return crops
 
 class SANet(nn.Module):
@@ -420,8 +512,8 @@ class SANet(nn.Module):
                 proposal = proposal.astype(np.int64)
                 proposal[:, 1:] = ext2factor(proposal[:, 1:], 4)
                 proposal[:, 1:] = clip_boxes(proposal[:, 1:], inputs.shape[2:])
-                # rcnn_crops = self.rcnn_crop(features, inputs, torch.from_numpy(proposal).cuda())
-                features = [t.unsqueeze(0).expand(internal_parallel_size(), -1, -1, -1, -1, -1) for t in features]
+                # # rcnn_crops = self.rcnn_crop(features, inputs, torch.from_numpy(proposal).cuda())
+                # features = [t.unsqueeze(0).expand(internal_parallel_size(), -1, -1, -1, -1, -1) for t in features]
                 rcnn_crops = data_parallel(self.rcnn_crop, (features, inputs, torch.from_numpy(proposal).cuda()))
                 # rcnn_crops = self.rcnn_crop(fs, inputs, self.rpn_proposals)
                 # self.rcnn_logits, self.rcnn_deltas = self.rcnn_head(rcnn_crops)

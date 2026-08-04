@@ -27,7 +27,7 @@ def rpn_gt_fg_thresholds(cfg, pos_truth_box):
     small_max_side = float(cfg.get('rpn_train_small_gt_max_side', 10.0))
     small_thresh = float(cfg.get('rpn_train_small_gt_fg_thresh_low', 0.2))
     max_side = np.max(pos_truth_box[:, 3:6], axis=1)
-    thresholds[max_side < small_max_side] = small_thresh
+    thresholds[max_side <= small_max_side] = small_thresh
     return thresholds
 
 

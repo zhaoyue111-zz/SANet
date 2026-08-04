@@ -145,8 +145,8 @@ def eval(net, dataset, save_dir=None):
             with torch.no_grad():
                 net.forward(input, truth_bboxes, truth_labels)
 
-            # detections = net.rpn_proposals.cpu().numpy()
-            detections = net.detections.cpu().numpy()
+            # detections = net.rpn_proposals.cpu().numpy() # 进入RCNN的RPN最终 proposal
+            detections = net.detections.cpu().numpy()  # RCNN分类、回归和NMS后的最终检测框
 
             print('detections', detections.shape)
 

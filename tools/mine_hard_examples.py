@@ -306,8 +306,8 @@ def infer_dataset(net, dataset_cfg, out_dir, num_workers):
 def parse_args():
     parser = argparse.ArgumentParser(description='Mine hard FP/FN samples from the training set.')
     parser.add_argument('--dataset', default='all', help="dataset name under data/, or 'all'")
-    parser.add_argument('--ckpt', default='pretrained/model.ckpt', help='checkpoint used for mining')
-    parser.add_argument('--out-dir', default='hard_examples', help='directory to save mined CSVs')
+    parser.add_argument('--ckpt', default='/mnt/afs2/code/SANet/train_pretrained_hardsamples_rcnn40_PN11_v3_lt1002/model/best_rcnn.ckpt', help='checkpoint used for mining')
+    parser.add_argument('--out-dir', default='hard_examples_train_v3', help='directory to save mined CSVs')
     parser.add_argument('--fp-threshold', type=float, default=0.9, help='minimum FP probability to keep')
     parser.add_argument('--num-workers', type=int, default=0, help='DataLoader workers')
     parser.add_argument('--gpu', default=None, help='CUDA_VISIBLE_DEVICES value')
