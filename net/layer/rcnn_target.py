@@ -5,6 +5,7 @@ import random
 import numpy as np
 import torch
 from torch.autograd import Variable
+from net.layer.rpn_target import rpn_gt_fg_thresholds
 try:
     from utils.pybox import *
 except ImportError:
@@ -75,7 +76,12 @@ def make_one_rcnn_target(cfg, input, proposal, truth_box, truth_label, ignore_bo
     argmax_overlap = np.argmax(overlap,1)
     max_overlap = overlap[np.arange(num_proposal),argmax_overlap]
 
-    fg_index = np.where(max_overlap >= cfg['rcnn_train_fg_thresh_low'])[0]
+    # Keep RCNN foreground assignment consistent with RPN. Small GTs can use
+    # the adaptive low IoU threshold configured for RPN instead of the legacy
+    # fixed rcnn_train_fg_thresh_low value.
+    gt_fg_thresholds = rpn_gt_fg_thresholds(cfg, truth_box)
+    proposal_fg_thresholds = gt_fg_thresholds[argmax_overlap]
+    fg_index = np.where(max_overlap >= proposal_fg_thresholds)[0]
     bg_index = np.where(max_overlap <  cfg['rcnn_train_bg_thresh_high'])[0]
     if len(ignore_box) and len(bg_index):
         ignore_overlap = _overlap_to_numpy(torch_overlap(box, ignore_box))
@@ -145,6 +151,8 @@ def make_one_rcnn_target(cfg, input, proposal, truth_box, truth_label, ignore_bo
         target_box = sampled_proposal[:num_fg,:][:, 2:8]
         sampled_target = rcnn_encode(target_box, target_truth_box, cfg['box_reg_weight'])
 
+    if not isinstance(sampled_target, np.ndarray):
+        sampled_target = sampled_target.detach().cpu().numpy()
     sampled_target   = Variable(torch.from_numpy(sampled_target)).float().cuda()
     sampled_label    = Variable(torch.from_numpy(sampled_label).reshape(-1)).long().cuda()
     sampled_proposal = Variable(torch.from_numpy(sampled_proposal)).cuda()
