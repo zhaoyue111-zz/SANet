@@ -130,10 +130,11 @@ class FeatureNet(nn.Module):
 
     def forward(self, x):
         x1, out1, out2, out3, out4 = self.resnet50(x) # x:[B, 1, 128, 128, 128]
-        # x1:[B, 64, 64, 64, 64] 
-        # out1:[B, 64, 64, 64, 64] 
-        # out2:[B, 64, 32, 32, 32] 
+        # x1:[B, 64, 64, 64, 64]
+        # out1:[B, 64, 64, 64, 64]
+        # out2:[B, 64, 32, 32, 32]
         # out3:[B, 64, 16, 16, 16]
+        # out4:[B, 64, 8, 8, 8]
 
         out4 = self.reduce1(out4) # [B, 64, 8, 8, 8]
         rev3 = self.path1(out4) # [B, 64, 16, 16, 16]
@@ -145,19 +146,77 @@ class FeatureNet(nn.Module):
 
         return [x1, out1, comb2], out1
 
+class ASPP3D(nn.Module):
+    """
+    Lightweight 3D ASPP for SANet RPN.
+    """
+
+    def __init__(self,in_channels=128,out_channels=64,dilations=(1, 2, 3),):
+        super(ASPP3D, self).__init__()
+
+        # 4 branches: 1x1x1 + three 3x3x3 dilated convolutions.
+        num_branches = 1 + len(dilations)
+
+        if out_channels % num_branches != 0:
+            raise ValueError(f"out_channels must be divisible by the number of ASPP branches: {out_channels} % {num_branches} != 0")
+
+        branch_channels = out_channels // num_branches
+
+        self.branches = nn.ModuleList()
+
+        # Local channel projection branch.
+        self.branches.append(
+            nn.Sequential(
+                nn.Conv3d(in_channels,branch_channels,kernel_size=1,bias=False,),
+                nn.GroupNorm(num_groups=4,num_channels=branch_channels,),
+                nn.ReLU(inplace=True),
+            )
+        )
+
+        # Dilated spatial branches.
+        for dilation in dilations:
+            self.branches.append(
+                nn.Sequential(
+                    nn.Conv3d(in_channels,branch_channels,kernel_size=3,padding=dilation,dilation=dilation,bias=False,),
+                    nn.GroupNorm(num_groups=4,num_channels=branch_channels,),
+                    nn.ReLU(inplace=True),
+                )
+            )
+
+        # Fuse concatenated multi-scale features.
+        self.project = nn.Sequential(
+            nn.Conv3d(out_channels,out_channels,kernel_size=1,bias=False,),
+            nn.GroupNorm(num_groups=8,num_channels=out_channels,),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        features = [branch(x) for branch in self.branches]
+        x = torch.cat(features, dim=1)
+        return self.project(x)
+
 class RpnHead(nn.Module):
-    def __init__(self, config, in_channels=128):
+    def __init__(self, config, in_channels=128, use_aspp=False):
         super(RpnHead, self).__init__()
-        dropout_p = float(config.get('rpn_dropout', 0.2))
-        self.drop = nn.Dropout3d(p=dropout_p, inplace=False)
+        self.drop = nn.Dropout3d(p=0.5, inplace=False)
+        self.use_aspp=use_aspp
         self.conv = nn.Sequential(nn.Conv3d(in_channels, 64, kernel_size=1),
                                     nn.ReLU())
+        if self.use_aspp:
+            self.aspp = ASPP3D(in_channels=in_channels,out_channels=64,dilations=(1, 2, 3),)
+            self.aspp_weight = nn.Parameter(torch.zeros(1))
+
         self.logits = nn.Conv3d(64, 1 * len(config['anchors']), kernel_size=1)
         self.deltas = nn.Conv3d(64, 6 * len(config['anchors']), kernel_size=1)
 
     def forward(self, f):
-        out = self.drop(f)
-        out = self.conv(out)
+        # out = self.drop(f)
+        base = self.conv(f)
+        if self.use_aspp:
+            context = self.aspp(f)
+            out = base + self.aspp_weight * context
+        else:
+            out = base
 
         logits = self.logits(out)
         deltas = self.deltas(out)
@@ -177,7 +236,6 @@ class RcnnHead(nn.Module):
         super(RcnnHead, self).__init__()
         self.num_class = cfg['num_class']
         self.crop_size = cfg['rcnn_crop_size']
-        self.dropout_p = float(cfg.get('rcnn_dropout', 0.3))
 
         self.fc1 = nn.Linear(in_channels * self.crop_size[0] * self.crop_size[1] * self.crop_size[2], 512)
         self.fc2 = nn.Linear(512, 256)
@@ -187,9 +245,8 @@ class RcnnHead(nn.Module):
     def forward(self, crops):
         x = crops.view(crops.size(0), -1)
         x = F.relu(self.fc1(x), inplace=True)
-        x = F.dropout(x, p=self.dropout_p, training=self.training)
         x = F.relu(self.fc2(x), inplace=True)
-        x = F.dropout(x, p=self.dropout_p, training=self.training)
+        # x = F.dropout(x, 0.5, training=self.training)
         logits = self.logit(x)
         deltas = self.delta(x)
 
@@ -403,13 +460,15 @@ class CropRoi(nn.Module):
         return crops
 
 class SANet(nn.Module):
-    def __init__(self, cfg, mode='train'):
+    def __init__(self, cfg, mode='train',use_aspp=False):
         super(SANet, self).__init__()
 
         self.cfg = cfg
         self.mode = mode
+        self.loss_weights = cfg.get('loss_weights', (1.0, 1.0, 1.0, 1.0))
         self.feature_net = FeatureNet(config)
-        self.rpn = RpnHead(config, in_channels=128)
+        self.use_aspp = use_aspp
+        self.rpn = RpnHead(config, in_channels=128,use_aspp=self.use_aspp)
         self.rcnn_head = RcnnHead(config, in_channels=64)
         self.rcnn_crop = CropRoi(self.cfg, cfg['rcnn_crop_size'])
         self.use_rcnn = False
@@ -474,6 +533,7 @@ class SANet(nn.Module):
                     fpr_res = get_probability(self.cfg, self.mode, inputs, self.rpn_proposals, self.rcnn_logits,
                                               self.rcnn_deltas)
                     if self.ensemble_proposals.shape[0] == fpr_res.shape[0]:
+                        print("ensemble")
                         self.ensemble_proposals[:, 1] = (self.ensemble_proposals[:, 1] + fpr_res[:, 0]) / 2
             else:
                 self.rcnn_logits = inputs.new_zeros((0, self.cfg['num_class']))
@@ -499,8 +559,8 @@ class SANet(nn.Module):
             self.rcnn_cls_loss, self.rcnn_reg_loss, rcnn_stats = \
                 rcnn_loss(self.rcnn_logits, self.rcnn_deltas, self.rcnn_labels, self.rcnn_targets)
 
-        self.total_loss = self.rpn_cls_loss + self.rpn_reg_loss \
-                          + self.rcnn_cls_loss +  self.rcnn_reg_loss
+        w_rpn_cls, w_rpn_reg, w_rcnn_cls, w_rcnn_reg = self.loss_weights
+        self.total_loss = w_rpn_cls * self.rpn_cls_loss + w_rpn_reg * self.rpn_reg_loss + w_rcnn_cls * self.rcnn_cls_loss + w_rcnn_reg * self.rcnn_reg_loss
 
 
         return self.total_loss, rpn_stats, rcnn_stats

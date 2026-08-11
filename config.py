@@ -139,7 +139,7 @@ train_config = {
     'epochs': 200,
     'epoch_save': 20,
     'epoch_rcnn': 40,  # 从第几个 epoch 开始启用 RCNN/FPR 分支。当前 20，前 19 个 epoch只训练 RPN。
-    'early_stop_patience': 40,  # val_froc_mean 连续多少轮不创新高则早停；<=0 关闭
+    'early_stop_patience': 40,  # RCNN 前看 best_froc_mean，RCNN 开始后看 best_rcnn_froc_mean；<=0 关闭
 
     'num_workers': 8,
     'dataset': DEFAULT_DATASET,

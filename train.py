@@ -236,11 +236,9 @@ parser.add_argument('--init-lr', default=train_config['init_lr'], type=float,
 parser.add_argument('--momentum', default=train_config['momentum'], type=float, metavar='M',
                     help='momentum')
 parser.add_argument('--weight-decay', default=train_config['weight_decay'], type=float,
-                    metavar='W', help='weight decay (default: 3e-4)')
+                    metavar='W', help='weight decay (default: 1e-4)')
 parser.add_argument('--epoch-save', default=train_config['epoch_save'], type=int, metavar='S',
                     help='save frequency')
-parser.add_argument('--early-stop-patience', default=train_config.get('early_stop_patience', 40), type=int,
-                    help='Stop if val_froc_mean does not improve for this many epochs. <=0 disables.')
 parser.add_argument('--out-dir', default="train_output", type=str, metavar='OUT',
                     help='directory to save results of this training')
 parser.add_argument('--train-set', default=train_config['train_set_list'], nargs='+', type=str,
@@ -384,6 +382,10 @@ def checkpoint_update_flags(epoch, epoch_rcnn, val_froc_mean, best_froc_mean, be
     return is_best, is_best_rcnn, next_best_froc_mean, next_best_rcnn_froc_mean
 
 
+def early_stop_improved(epoch, epoch_rcnn, is_best, is_best_rcnn):
+    return is_best_rcnn if epoch >= epoch_rcnn else is_best
+
+
 def build_split_dataset(dataset_name, split, hard_fp_csv=None, hard_fn_csv=None,
                         hard_fp_threshold=0.9, train_neg_pos_ratio=1.0):
     cfgs = dataset_configs(dataset_name, skip_missing=(dataset_name == 'all'))
@@ -484,7 +486,7 @@ def main():
     best_loss = np.inf
     best_froc_mean = -np.inf
     best_rcnn_froc_mean = -np.inf
-    epochs_since_froc_improve = 0
+    early_stop_no_improve = 0
     optimizer_state = None
 
     if initial_checkpoint:
@@ -506,7 +508,7 @@ def main():
             best_loss = checkpoint.get('best_loss', np.inf)
             best_froc_mean = checkpoint.get('best_froc_mean', -np.inf)
             best_rcnn_froc_mean = checkpoint.get('best_rcnn_froc_mean', -np.inf)
-            epochs_since_froc_improve = checkpoint.get('epochs_since_froc_improve', 0)
+            early_stop_no_improve = checkpoint.get('early_stop_no_improve', 0)
             optimizer_state = checkpoint.get('optimizer')
 
         state = net.state_dict()
@@ -624,68 +626,74 @@ def main():
         val_loss = distributed_mean(val_summary['loss'], args)
         val_froc_mean = distributed_mean(val_summary['froc_mean'], args)
 
-        should_stop = torch.zeros(1, dtype=torch.int32, device=args.device)
-
-        if is_main_process(args):
-            state_dict = unwrap_model(net).state_dict()
-            for key in state_dict.keys():
-                state_dict[key] = state_dict[key].cpu()
-
-            if val_loss < best_loss:
-                best_loss = val_loss
-            is_best, is_best_rcnn, best_froc_mean, best_rcnn_froc_mean = checkpoint_update_flags(
-                i,
-                epoch_rcnn,
-                val_froc_mean,
-                best_froc_mean,
-                best_rcnn_froc_mean,
-            )
-            if is_best:
-                epochs_since_froc_improve = 0
+        is_best, is_best_rcnn, best_froc_mean, best_rcnn_froc_mean = checkpoint_update_flags(
+            i,
+            epoch_rcnn,
+            val_froc_mean,
+            best_froc_mean,
+            best_rcnn_froc_mean,
+        )
+        early_stop_patience = int(train_config.get('early_stop_patience', 0))
+        early_stop_metric = 'best_rcnn_froc_mean' if i >= epoch_rcnn else 'best_froc_mean'
+        should_stop = False
+        if early_stop_patience > 0:
+            if early_stop_improved(i, epoch_rcnn, is_best, is_best_rcnn):
+                early_stop_no_improve = 0
             else:
-                epochs_since_froc_improve += 1
+                early_stop_no_improve += 1
+            should_stop = early_stop_no_improve >= early_stop_patience
 
-            checkpoint = {
-                'epoch': i,
-                'out_dir': out_dir,
-                'state_dict': state_dict,
-                'optimizer': optimizer.state_dict(),
-                'best_loss': best_loss,
-                'best_froc_mean': best_froc_mean,
-                'best_rcnn_froc_mean': best_rcnn_froc_mean,
-                'epochs_since_froc_improve': epochs_since_froc_improve,
-                'val_loss': val_loss,
-                'val_froc_mean': val_froc_mean,
-                'val_det_summary': val_summary['det'],
-                'val_rpn_det_summary': val_summary['rpn_det'],
-            }
-            # if i % epoch_save == 0:
-            #     torch.save(checkpoint, os.path.join(model_out_dir, '%03d.ckpt' % i))
+        if not is_main_process(args):
+            if args.distributed:
+                dist.barrier()
+            if should_stop:
+                break
+            continue
 
-            torch.save(checkpoint, os.path.join(model_out_dir, 'final.ckpt'))
-            if is_best:
-                torch.save(checkpoint, os.path.join(model_out_dir, 'best.ckpt'))
-                print('[best checkpoint updated: epoch %d, val_froc_mean %.6f, val_loss %.6f]' % (
-                    i, val_froc_mean, val_loss))
-            if is_best_rcnn:
-                torch.save(checkpoint, os.path.join(model_out_dir, 'best_rcnn.ckpt'))
-                print('[best RCNN checkpoint updated: epoch %d, val_froc_mean %.6f, val_loss %.6f]' % (
-                    i, val_froc_mean, val_loss))
+        state_dict = unwrap_model(net).state_dict()
+        for key in state_dict.keys():
+            state_dict[key] = state_dict[key].cpu()
 
-            early_stop_patience = int(args.early_stop_patience)
-            if early_stop_patience > 0 and epochs_since_froc_improve >= early_stop_patience:
-                print(
-                    '[early stop] no val_froc_mean improvement for %d epochs '
-                    '(best=%.6f, last=%.6f, epoch=%d)'
-                    % (early_stop_patience, best_froc_mean, val_froc_mean, i)
-                )
-                should_stop[0] = 1
+        if val_loss < best_loss:
+            best_loss = val_loss
 
+        checkpoint = {
+            'epoch': i,
+            'out_dir': out_dir,
+            'state_dict': state_dict,
+            'optimizer': optimizer.state_dict(),
+            'best_loss': best_loss,
+            'best_froc_mean': best_froc_mean,
+            'best_rcnn_froc_mean': best_rcnn_froc_mean,
+            'early_stop_no_improve': early_stop_no_improve,
+            'val_loss': val_loss,
+            'val_froc_mean': val_froc_mean,
+            'val_det_summary': val_summary['det'],
+            'val_rpn_det_summary': val_summary['rpn_det'],
+        }
+        # if i % epoch_save == 0:
+        #     torch.save(checkpoint, os.path.join(model_out_dir, '%03d.ckpt' % i))
+
+        torch.save(checkpoint, os.path.join(model_out_dir, 'final.ckpt'))
+        if is_best:
+            torch.save(checkpoint, os.path.join(model_out_dir, 'best.ckpt'))
+            print('[best checkpoint updated: epoch %d, val_froc_mean %.6f, val_loss %.6f]' % (
+                i, val_froc_mean, val_loss))
+        if is_best_rcnn:
+            torch.save(checkpoint, os.path.join(model_out_dir, 'best_rcnn.ckpt'))
+            print('[best RCNN checkpoint updated: epoch %d, val_froc_mean %.6f, val_loss %.6f]' % (
+                i, val_froc_mean, val_loss))
+
+        if early_stop_patience > 0:
+            print('[early stop: metric %s, no_improve %d/%d]' % (
+                early_stop_metric, early_stop_no_improve, early_stop_patience))
+            if should_stop:
+                print('[early stop triggered at epoch %d using %s]' % (i, early_stop_metric))
+                if args.distributed:
+                    dist.barrier()
+                break
         if args.distributed:
-            dist.broadcast(should_stop, src=0)
             dist.barrier()
-        if int(should_stop.item()) == 1:
-            break
 
     writer.close()
     train_writer.close()

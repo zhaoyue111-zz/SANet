@@ -22,6 +22,7 @@ CFG = {
     "rpn_train_adaptive_fg_thresh": True,
     "rpn_train_small_gt_max_side": 10.0,
     "rpn_train_small_gt_fg_thresh_low": 0.2,
+    "bbox_border": 8.0,
     "box_reg_weight": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
 }
 
@@ -42,11 +43,11 @@ def iou(window, truth_box):
 
 
 def check_small_gt_low_iou_anchor_is_positive():
-    truth = np.asarray([[20, 20, 20, 8, 8, 8]], dtype=np.float32)
+    truth = np.asarray([[20, 20, 20, 16, 16, 16]], dtype=np.float32)
     labels = np.asarray([1], dtype=np.int64)
     window = np.asarray([
-        [20, 20, 20, 8, 8, 8],
-        [23, 20, 20, 8, 8, 8],
+        [20, 20, 20, 16, 16, 16],
+        [28, 20, 20, 16, 16, 16],
     ], dtype=np.float32)
     overlap = iou(window, truth)[:, 0]
     if not (0.2 <= overlap[1] < 0.5):
@@ -56,27 +57,27 @@ def check_small_gt_low_iou_anchor_is_positive():
         raise AssertionError("small-GT anchor should be positive under adaptive threshold")
 
 
-def check_equal_10_uses_base_threshold():
-    truth = np.asarray([[20, 20, 20, 10, 10, 10]], dtype=np.float32)
+def check_raw_equal_10_uses_small_threshold():
+    truth = np.asarray([[20, 20, 20, 18, 18, 18]], dtype=np.float32)
     labels = np.asarray([1], dtype=np.int64)
     window = np.asarray([
-        [20, 20, 20, 10, 10, 10],
-        [24, 20, 20, 10, 10, 10],
+        [20, 20, 20, 18, 18, 18],
+        [29, 20, 20, 18, 18, 18],
     ], dtype=np.float32)
     overlap = iou(window, truth)[:, 0]
     if not (0.2 <= overlap[1] < 0.5):
         raise AssertionError("test setup expected IoU in [0.2, 0.5), got %.6f" % overlap[1])
     label, _, weight, _, _ = assign_rpn_anchors(CFG, window, truth, labels)
-    if label[1] != 0 or weight[1] != 0:
-        raise AssertionError("max_side=10 should use base threshold and not mark IoU<0.5 positive")
+    if label[1] != 1 or weight[1] <= 0:
+        raise AssertionError("raw max_side=10 should use small threshold")
 
 
 def check_large_gt_low_iou_anchor_not_adaptive_positive():
-    truth = np.asarray([[20, 20, 20, 12, 12, 12]], dtype=np.float32)
+    truth = np.asarray([[20, 20, 20, 20, 20, 20]], dtype=np.float32)
     labels = np.asarray([1], dtype=np.int64)
     window = np.asarray([
-        [20, 20, 20, 12, 12, 12],
-        [25, 20, 20, 12, 12, 12],
+        [20, 20, 20, 20, 20, 20],
+        [30.5, 20, 20, 20, 20, 20],
     ], dtype=np.float32)
     overlap = iou(window, truth)[:, 0]
     if not (0.2 <= overlap[1] < 0.5):
@@ -88,15 +89,15 @@ def check_large_gt_low_iou_anchor_not_adaptive_positive():
 
 def check_mixed_gt_uses_each_gt_threshold():
     truth = np.asarray([
-        [20, 20, 20, 8, 8, 8],
-        [60, 60, 60, 12, 12, 12],
+        [20, 20, 20, 16, 16, 16],
+        [70, 70, 70, 20, 20, 20],
     ], dtype=np.float32)
     labels = np.asarray([1, 1], dtype=np.int64)
     window = np.asarray([
-        [20, 20, 20, 8, 8, 8],
-        [23, 20, 20, 8, 8, 8],
-        [60, 60, 60, 12, 12, 12],
-        [65, 60, 60, 12, 12, 12],
+        [20, 20, 20, 16, 16, 16],
+        [28, 20, 20, 16, 16, 16],
+        [70, 70, 70, 20, 20, 20],
+        [80.5, 70, 70, 20, 20, 20],
     ], dtype=np.float32)
     label, assign, weight, _, _ = assign_rpn_anchors(CFG, window, truth, labels)
     if label[1] != 1 or weight[1] <= 0 or assign[1] != 0:
@@ -108,14 +109,14 @@ def check_mixed_gt_uses_each_gt_threshold():
 def check_regression_target_matches_assigned_gt():
     maybe_patch_cuda()
     truth = np.asarray([
-        [20, 20, 20, 8, 8, 8],
-        [60, 60, 60, 12, 12, 12],
+        [20, 20, 20, 16, 16, 16],
+        [70, 70, 70, 20, 20, 20],
     ], dtype=np.float32)
     labels = np.asarray([1, 1], dtype=np.int64)
     window = np.asarray([
-        [20, 20, 20, 8, 8, 8],
-        [23, 20, 20, 8, 8, 8],
-        [60, 60, 60, 12, 12, 12],
+        [20, 20, 20, 16, 16, 16],
+        [28, 20, 20, 16, 16, 16],
+        [70, 70, 70, 20, 20, 20],
     ], dtype=np.float32)
     label, assign, weight, target, target_weight = make_one_rpn_target(
         CFG,
@@ -141,11 +142,11 @@ def check_regression_target_matches_assigned_gt():
 def check_switch_off_uses_original_threshold():
     cfg = dict(CFG)
     cfg["rpn_train_adaptive_fg_thresh"] = False
-    truth = np.asarray([[20, 20, 20, 8, 8, 8]], dtype=np.float32)
+    truth = np.asarray([[20, 20, 20, 16, 16, 16]], dtype=np.float32)
     labels = np.asarray([1], dtype=np.int64)
     window = np.asarray([
-        [20, 20, 20, 8, 8, 8],
-        [23, 20, 20, 8, 8, 8],
+        [20, 20, 20, 16, 16, 16],
+        [28, 20, 20, 16, 16, 16],
     ], dtype=np.float32)
     label, _, weight, _, _ = assign_rpn_anchors(cfg, window, truth, labels)
     if label[1] != 0 or weight[1] != 0:
@@ -154,7 +155,7 @@ def check_switch_off_uses_original_threshold():
 
 def main():
     check_small_gt_low_iou_anchor_is_positive()
-    check_equal_10_uses_base_threshold()
+    check_raw_equal_10_uses_small_threshold()
     check_large_gt_low_iou_anchor_not_adaptive_positive()
     check_mixed_gt_uses_each_gt_threshold()
     check_regression_target_matches_assigned_gt()

@@ -26,6 +26,23 @@ def load_checkpoint_update_flags():
 checkpoint_update_flags = load_checkpoint_update_flags()
 
 
+def load_early_stop_improved():
+    train_path = os.path.join(ROOT_DIR, "train.py")
+    with open(train_path, "r", encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=train_path)
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "early_stop_improved":
+            module = ast.Module(body=[node], type_ignores=[])
+            ast.fix_missing_locations(module)
+            namespace = {}
+            exec(compile(module, train_path, "exec"), namespace)
+            return namespace["early_stop_improved"]
+    raise AssertionError("early_stop_improved not found in train.py")
+
+
+early_stop_improved = load_early_stop_improved()
+
+
 def check_before_rcnn_updates_only_global_best():
     is_best, is_best_rcnn, best_froc, best_rcnn_froc = checkpoint_update_flags(
         epoch=39,
@@ -74,11 +91,21 @@ def check_equal_froc_does_not_update():
         raise AssertionError("equal FROC should not replace existing best checkpoints")
 
 
+def check_early_stop_uses_rcnn_best_after_rcnn_start():
+    if not early_stop_improved(epoch=39, epoch_rcnn=40, is_best=True, is_best_rcnn=False):
+        raise AssertionError("pre-RCNN early stop should use global best improvement")
+    if early_stop_improved(epoch=40, epoch_rcnn=40, is_best=True, is_best_rcnn=False):
+        raise AssertionError("RCNN-stage early stop should not use global best improvement")
+    if not early_stop_improved(epoch=40, epoch_rcnn=40, is_best=False, is_best_rcnn=True):
+        raise AssertionError("RCNN-stage early stop should use RCNN best improvement")
+
+
 def main():
     check_before_rcnn_updates_only_global_best()
     check_after_rcnn_updates_both_when_best()
     check_after_rcnn_updates_only_rcnn_best()
     check_equal_froc_does_not_update()
+    check_early_stop_uses_rcnn_best_after_rcnn_start()
     print("ok: checkpoint FROC selection checks passed")
 
 

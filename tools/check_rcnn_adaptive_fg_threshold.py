@@ -25,6 +25,7 @@ CFG = {
     "rpn_train_adaptive_fg_thresh": True,
     "rpn_train_small_gt_max_side": 10.0,
     "rpn_train_small_gt_fg_thresh_low": 0.2,
+    "bbox_border": 8.0,
     "box_reg_weight": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
 }
 
@@ -73,9 +74,9 @@ def make_target(proposals, truth, labels=None, ignore=None, cfg=None):
 
 
 def check_small_gt_iou_03_is_foreground_with_regression_target():
-    truth = np.asarray([[20, 20, 20, 8, 8, 8]], dtype=np.float32)
-    fg_box = np.asarray([23, 20, 20, 8, 8, 8], dtype=np.float32)
-    bg_box = np.asarray([60, 60, 60, 8, 8, 8], dtype=np.float32)
+    truth = np.asarray([[20, 20, 20, 16, 16, 16]], dtype=np.float32)
+    fg_box = np.asarray([28, 20, 20, 16, 16, 16], dtype=np.float32)
+    bg_box = np.asarray([60, 60, 60, 16, 16, 16], dtype=np.float32)
     overlap = iou([fg_box], truth)[0, 0]
     if not (0.2 <= overlap < 0.5):
         raise AssertionError("test setup expected IoU in [0.2, 0.5), got %.6f" % overlap)
@@ -100,9 +101,9 @@ def check_small_gt_iou_03_is_foreground_with_regression_target():
 
 
 def check_large_gt_iou_03_is_not_foreground():
-    truth = np.asarray([[20, 20, 20, 12, 12, 12]], dtype=np.float32)
-    candidate = np.asarray([25, 20, 20, 12, 12, 12], dtype=np.float32)
-    bg_box = np.asarray([60, 60, 60, 12, 12, 12], dtype=np.float32)
+    truth = np.asarray([[20, 20, 20, 20, 20, 20]], dtype=np.float32)
+    candidate = np.asarray([30.5, 20, 20, 20, 20, 20], dtype=np.float32)
+    bg_box = np.asarray([70, 70, 70, 20, 20, 20], dtype=np.float32)
     overlap = iou([candidate], truth)[0, 0]
     if not (0.2 <= overlap < 0.5):
         raise AssertionError("test setup expected IoU in [0.2, 0.5), got %.6f" % overlap)
@@ -113,8 +114,8 @@ def check_large_gt_iou_03_is_not_foreground():
 
 
 def check_small_gt_iou_below_01_is_background():
-    truth = np.asarray([[20, 20, 20, 8, 8, 8]], dtype=np.float32)
-    bg_box = np.asarray([60, 60, 60, 8, 8, 8], dtype=np.float32)
+    truth = np.asarray([[20, 20, 20, 16, 16, 16]], dtype=np.float32)
+    bg_box = np.asarray([60, 60, 60, 16, 16, 16], dtype=np.float32)
     overlap = iou([bg_box], truth)[0, 0]
     if overlap >= 0.1:
         raise AssertionError("test setup expected IoU < 0.1, got %.6f" % overlap)
@@ -128,9 +129,9 @@ def check_small_gt_iou_below_01_is_background():
 
 
 def check_large_gt_iou_05_is_foreground():
-    truth = np.asarray([[20, 20, 20, 12, 12, 12]], dtype=np.float32)
-    fg_box = np.asarray([22, 20, 20, 12, 12, 12], dtype=np.float32)
-    bg_box = np.asarray([60, 60, 60, 12, 12, 12], dtype=np.float32)
+    truth = np.asarray([[20, 20, 20, 20, 20, 20]], dtype=np.float32)
+    fg_box = np.asarray([23, 20, 20, 20, 20, 20], dtype=np.float32)
+    bg_box = np.asarray([70, 70, 70, 20, 20, 20], dtype=np.float32)
     overlap = iou([fg_box], truth)[0, 0]
     if overlap < 0.5:
         raise AssertionError("test setup expected IoU >= 0.5, got %.6f" % overlap)
@@ -145,7 +146,7 @@ def check_large_gt_iou_05_is_foreground():
 
 
 def check_no_gt_returns_background():
-    bg_box = np.asarray([60, 60, 60, 8, 8, 8], dtype=np.float32)
+    bg_box = np.asarray([60, 60, 60, 16, 16, 16], dtype=np.float32)
     _, labels, assigns, targets = make_target([proposal_row(bg_box)], np.zeros((0, 6), np.float32))
     if not len(as_numpy(labels)) or np.any(as_numpy(labels) != 0):
         raise AssertionError("no-GT proposals should be sampled as background")
@@ -154,7 +155,7 @@ def check_no_gt_returns_background():
 
 
 def check_ignore_gt_filters_background():
-    ignore = np.asarray([[60, 60, 60, 8, 8, 8]], dtype=np.float32)
+    ignore = np.asarray([[60, 60, 60, 16, 16, 16]], dtype=np.float32)
     _, labels, _, _ = make_target(
         [proposal_row(ignore[0])],
         np.zeros((0, 6), np.float32),
@@ -165,15 +166,15 @@ def check_ignore_gt_filters_background():
 
 
 def check_only_foreground_and_only_background_edges():
-    truth = np.asarray([[20, 20, 20, 8, 8, 8]], dtype=np.float32)
-    fg_box = np.asarray([23, 20, 20, 8, 8, 8], dtype=np.float32)
+    truth = np.asarray([[20, 20, 20, 16, 16, 16]], dtype=np.float32)
+    fg_box = np.asarray([28, 20, 20, 16, 16, 16], dtype=np.float32)
     proposals, labels, assigns, targets = make_target([proposal_row(fg_box)], truth)
     if len(as_numpy(labels)) != 1 or as_numpy(labels)[0] <= 0 or np.asarray(assigns)[0] != 0:
         raise AssertionError("only-foreground case should still sample foreground")
     if as_numpy(targets).shape != (1, 6):
         raise AssertionError("only-foreground case should produce one 6D regression target")
 
-    bg_box = np.asarray([60, 60, 60, 8, 8, 8], dtype=np.float32)
+    bg_box = np.asarray([60, 60, 60, 16, 16, 16], dtype=np.float32)
     _, labels, assigns, targets = make_target([proposal_row(bg_box)], truth)
     labels = as_numpy(labels)
     assigns = np.asarray(assigns)
@@ -186,9 +187,9 @@ def check_only_foreground_and_only_background_edges():
 def check_adaptive_switch_off_uses_base_threshold():
     cfg = dict(CFG)
     cfg["rpn_train_adaptive_fg_thresh"] = False
-    truth = np.asarray([[20, 20, 20, 8, 8, 8]], dtype=np.float32)
-    candidate = np.asarray([23, 20, 20, 8, 8, 8], dtype=np.float32)
-    bg_box = np.asarray([60, 60, 60, 8, 8, 8], dtype=np.float32)
+    truth = np.asarray([[20, 20, 20, 16, 16, 16]], dtype=np.float32)
+    candidate = np.asarray([28, 20, 20, 16, 16, 16], dtype=np.float32)
+    bg_box = np.asarray([60, 60, 60, 16, 16, 16], dtype=np.float32)
     _, labels, _, _ = make_target([proposal_row(candidate), proposal_row(bg_box)], truth, cfg=cfg)
     if np.any(as_numpy(labels) > 0):
         raise AssertionError("adaptive switch off should keep base foreground threshold")
