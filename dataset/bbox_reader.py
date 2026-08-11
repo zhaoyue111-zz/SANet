@@ -329,9 +329,14 @@ class BboxReader(Dataset):
                     allow_large_lesion_resize=allow_large_lesion_resize,
                 )
                 if self.mode == 'train' and not is_random_crop:
-                     sample, target, bboxes = augment(sample, target, bboxes, do_flip = self.augtype['flip'],
-                                                             do_rotate=self.augtype['rotate'], do_swap = self.augtype['swap'],
-                                                             pad_value=self.pad_value)
+                     sample, target, bboxes = augment(
+                         sample, target, bboxes,
+                         do_flip=self.augtype['flip'],
+                         do_rotate=self.augtype['rotate'],
+                         do_swap=self.augtype['swap'],
+                         pad_value=self.pad_value,
+                         rotate_angle_range=self.cfg.get('rotate_angle_range', 10.0),
+                     )
                 if self.mode == 'train':
                     sample = augment_intensity(
                         sample,
@@ -565,6 +570,26 @@ def _box_inside_shape(box, shape_zyx):
     return np.all(starts >= 0) and np.all(ends < shape_zyx) and np.all(ends > starts)
 
 
+def _has_valid_corner_box(box):
+    box = np.asarray(box, dtype=np.float32).reshape(-1)
+    if box.size < 6 or not np.isfinite(box[:6]).all():
+        return False
+    return bool(np.all(box[[1, 3, 5]] > box[[0, 2, 4]]))
+
+
+def _filter_boxes_inside_shape(boxes, shape_zyx):
+    boxes = np.asarray(boxes, dtype=np.float32)
+    if boxes.size == 0:
+        return boxes.reshape(0, 6)
+    kept = []
+    for box in boxes:
+        if _has_valid_corner_box(box) and _box_inside_shape(box, shape_zyx):
+            kept.append(box)
+    if not kept:
+        return np.zeros((0, boxes.shape[1]), dtype=np.float32)
+    return np.asarray(kept, dtype=np.float32)
+
+
 def _swap_corner_boxes(boxes, axisorder):
     boxes = np.asarray(boxes, dtype=np.float32)
     if boxes.size == 0:
@@ -577,73 +602,88 @@ def _swap_corner_boxes(boxes, axisorder):
     return swapped
 
 
-def augment(sample, target, bboxes, do_flip = True, do_rotate=True, do_swap = True, pad_value=170):
-    #  angle1 = np.random.rand()*180
+def augment(sample, target, bboxes, do_flip=True, do_rotate=True, do_swap=True,
+            pad_value=170, rotate_angle_range=10.0):
+    """Geometric augmentations with box sync.
+
+    Rotate is restricted to a mild in-plane angle so the main lesion is less
+    likely to leave the crop. Boxes that fall outside after rotation are dropped.
+    """
     target = np.asarray(target, dtype=np.float32)
     bboxes = np.asarray(bboxes, dtype=np.float32)
     if bboxes.size == 0:
         bboxes = bboxes.reshape(0, 6)
-    if do_rotate:
+    shape_zyx = sample.shape[1:4]
+    max_angle = abs(float(rotate_angle_range))
+
+    if do_rotate and max_angle > 0:
         validrot = False
         counter = 0
         while not validrot:
             newtarget = np.copy(target)
-            newbboxes = np.copy(bboxes)
-            angle1 = np.random.rand()*180
+            angle1 = np.random.uniform(-max_angle, max_angle)
             center_yx = (np.array(sample.shape[2:4]).astype(np.float32) - 1.0) / 2.0
-            rotmat = np.array([[np.cos(angle1/180*np.pi),-np.sin(angle1/180*np.pi)],[np.sin(angle1/180*np.pi),np.cos(angle1/180*np.pi)]])
-            if len(newtarget) >= 6 and np.isfinite(newtarget[:6]).all():
-                newtarget = _transform_corner_box_yx(newtarget, rotmat, center_yx)
-            for i in range(len(newbboxes)):
-                if np.isfinite(newbboxes[i, :6]).all():
-                    newbboxes[i] = _transform_corner_box_yx(newbboxes[i], rotmat, center_yx)
+            rotmat = np.array([
+                [np.cos(angle1 / 180 * np.pi), -np.sin(angle1 / 180 * np.pi)],
+                [np.sin(angle1 / 180 * np.pi), np.cos(angle1 / 180 * np.pi)],
+            ], dtype=np.float32)
 
-            if not np.isfinite(newtarget[:6]).all() or _box_inside_shape(newtarget, sample.shape[1:4]):
-                validrot = True
-                target = newtarget
-                sample = rotate(
-                    sample,
-                    angle1,
-                    axes=(2, 3),
-                    reshape=False,
-                    order=1,
-                    mode='constant',
-                    cval=float(pad_value),
-                    prefilter=False,
-                )
-                bboxes = newbboxes
-            else:
-                counter += 1
-                if counter ==3:
-                    break
+            if _has_valid_corner_box(newtarget):
+                newtarget = _transform_corner_box_yx(newtarget, rotmat, center_yx)
+                # 主病灶旋出 crop 则重试，避免框与 CT 错位训练
+                if not _box_inside_shape(newtarget, shape_zyx):
+                    counter += 1
+                    if counter >= 3:
+                        break
+                    continue
+
+            newbboxes = np.copy(bboxes)
+            for i in range(len(newbboxes)):
+                if _has_valid_corner_box(newbboxes[i]):
+                    newbboxes[i] = _transform_corner_box_yx(newbboxes[i], rotmat, center_yx)
+            newbboxes = _filter_boxes_inside_shape(newbboxes, shape_zyx)
+
+            target = newtarget
+            sample = rotate(
+                sample,
+                angle1,
+                axes=(2, 3),
+                reshape=False,
+                order=1,
+                mode='constant',
+                cval=float(pad_value),
+                prefilter=False,
+            )
+            bboxes = newbboxes
+            validrot = True
+
     if do_swap:
-        if sample.shape[1]==sample.shape[2] and sample.shape[1]==sample.shape[3]:
+        if sample.shape[1] == sample.shape[2] and sample.shape[1] == sample.shape[3]:
             axisorder = np.random.permutation(3)
-            sample = np.transpose(sample,np.concatenate([[0],axisorder+1]))
-            target = _swap_corner_boxes(target.reshape(1, -1), axisorder).reshape(-1)
+            sample = np.transpose(sample, np.concatenate([[0], axisorder + 1]))
+            if _has_valid_corner_box(target):
+                target = _swap_corner_boxes(target.reshape(1, -1), axisorder).reshape(-1)
             bboxes = _swap_corner_boxes(bboxes, axisorder)
 
     if do_flip:
-        # flipid = np.array([np.random.randint(2),np.random.randint(2),np.random.randint(2)])*2-1
-        flipid = np.array([1,np.random.randint(2),np.random.randint(2)])*2-1
-        sample = np.ascontiguousarray(sample[:,::flipid[0],::flipid[1],::flipid[2]])
-        # for ax in range(3):
-        #     if flipid[ax]==-1:
-        #         target[ax] = np.array(sample.shape[ax+1])-target[ax]
-        #         bboxes[:,ax]= np.array(sample.shape[ax+1])-bboxes[:,ax]
+        # z 轴不翻转；仅随机翻转 y/x，并同步角点框
+        flipid = np.array([1, np.random.randint(2), np.random.randint(2)]) * 2 - 1
+        sample = np.ascontiguousarray(sample[:, ::flipid[0], ::flipid[1], ::flipid[2]])
         for i in range(3):
-            if flipid[i]==-1:
+            if flipid[i] == -1:
                 tem = [0, 2, 4]
                 ax = tem[i]
                 dim = np.array(sample.shape[i + 1])
-                target_min = np.copy(target[ax])
-                target_max = np.copy(target[ax + 1])
-                target[ax] = dim - 1 - target_max
-                target[ax + 1] = dim - 1 - target_min
-                box_min = np.copy(bboxes[:, ax])
-                box_max = np.copy(bboxes[:, ax + 1])
-                bboxes[:, ax] = dim - 1 - box_max
-                bboxes[:, ax + 1] = dim - 1 - box_min
+                if _has_valid_corner_box(target):
+                    target_min = np.copy(target[ax])
+                    target_max = np.copy(target[ax + 1])
+                    target[ax] = dim - 1 - target_max
+                    target[ax + 1] = dim - 1 - target_min
+                if len(bboxes):
+                    box_min = np.copy(bboxes[:, ax])
+                    box_max = np.copy(bboxes[:, ax + 1])
+                    bboxes[:, ax] = dim - 1 - box_max
+                    bboxes[:, ax + 1] = dim - 1 - box_min
     return sample, target, bboxes
 
 

@@ -64,21 +64,26 @@ net_config = {
 
     'augtype': {
         'flip': True,
-        'rotate': False,
-        'scale': False,
-        'swap': False,
+        'rotate': True,   # 仅小角度平面旋转，见 rotate_angle_range
+        'scale': False,   # Crop.scale 路径较激进，默认关闭
+        'swap': False,    # 轴置换对 CT 不自然，保持关闭
         'intensity': True,
         'noise': True,
-        'blur': False,
+        'blur': True,
     },
+    # 仅绕轴向(y,x)小角度旋转；过大易把主病灶旋出 crop，且与框同步困难
+    'rotate_angle_range': 10.0,
     'r_rand_crop': 0.2,  # 随机背景 crop 比例，用于增加负样本覆盖
     'intensity_aug': {
-        'contrast_range': [0.85, 1.15],
-        'brightness_range': [-0.10, 0.10],
-        'noise_std': 0.03,
-        'blur_sigma': [0.5, 1.0],
+        'contrast_range': [0.8, 1.2],
+        'brightness_range': [-0.12, 0.12],
+        'noise_std': 0.04,
+        'blur_sigma': [0.4, 0.8],
     },
     'pad_value': 170,
+    # head dropout（仅 training 生效）
+    'rpn_dropout': 0.2,
+    'rcnn_dropout': 0.3,
 
     # region proposal network configuration
     'rpn_train_bg_thresh_high': 0.02,
@@ -129,11 +134,12 @@ train_config = {
     'lr_schedule': lr_shedule,
     'optimizer': 'SGD',
     'momentum': 0.9,
-    'weight_decay': 1e-4,
+    'weight_decay': 3e-4,
 
     'epochs': 200,
     'epoch_save': 20,
     'epoch_rcnn': 40,  # 从第几个 epoch 开始启用 RCNN/FPR 分支。当前 20，前 19 个 epoch只训练 RPN。
+    'early_stop_patience': 40,  # val_froc_mean 连续多少轮不创新高则早停；<=0 关闭
 
     'num_workers': 8,
     'dataset': DEFAULT_DATASET,
