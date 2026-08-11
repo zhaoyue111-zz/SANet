@@ -185,7 +185,7 @@ class ASPP3D(nn.Module):
 
         # Fuse concatenated multi-scale features.
         self.project = nn.Sequential(
-            nn.Conv3d(in_channels,branch_channels,kernel_size=1,bias=False,),
+            nn.Conv3d(out_channels,out_channels,kernel_size=1,bias=False,),
             nn.GroupNorm(num_groups=8,num_channels=out_channels,),
             nn.ReLU(inplace=True),
         )
@@ -196,13 +196,15 @@ class ASPP3D(nn.Module):
         return self.project(x)
 
 class RpnHead(nn.Module):
-    def __init__(self, config, in_channels=128):
+    def __init__(self, config, in_channels=128, use_aspp=False):
         super(RpnHead, self).__init__()
         self.drop = nn.Dropout3d(p=0.5, inplace=False)
+        self.use_aspp=use_aspp
         self.conv = nn.Sequential(nn.Conv3d(in_channels, 64, kernel_size=1),
                                     nn.ReLU())
-        self.aspp = ASPP3D(in_channels=in_channels,out_channels=64,dilations=(1, 2, 3),)
-        self.aspp_weight = nn.Parameter(torch.zeros(1))
+        if self.use_aspp:
+            self.aspp = ASPP3D(in_channels=in_channels,out_channels=64,dilations=(1, 2, 3),)
+            self.aspp_weight = nn.Parameter(torch.zeros(1))
 
         self.logits = nn.Conv3d(64, 1 * len(config['anchors']), kernel_size=1)
         self.deltas = nn.Conv3d(64, 6 * len(config['anchors']), kernel_size=1)
@@ -210,8 +212,11 @@ class RpnHead(nn.Module):
     def forward(self, f):
         # out = self.drop(f)
         base = self.conv(f)
-        context = self.aspp(f)
-        out = base + self.aspp_weight * context
+        if self.use_aspp:
+            context = self.aspp(f)
+            out = base + self.aspp_weight * context
+        else:
+            out = base
 
         logits = self.logits(out)
         deltas = self.deltas(out)
@@ -455,14 +460,15 @@ class CropRoi(nn.Module):
         return crops
 
 class SANet(nn.Module):
-    def __init__(self, cfg, mode='train'):
+    def __init__(self, cfg, mode='train',use_aspp=False):
         super(SANet, self).__init__()
 
         self.cfg = cfg
         self.mode = mode
         self.loss_weights = cfg.get('loss_weights', (1.0, 1.0, 1.0, 1.0))
         self.feature_net = FeatureNet(config)
-        self.rpn = RpnHead(config, in_channels=128)
+        self.use_aspp = use_aspp
+        self.rpn = RpnHead(config, in_channels=128,use_aspp=self.use_aspp)
         self.rcnn_head = RcnnHead(config, in_channels=64)
         self.rcnn_crop = CropRoi(self.cfg, cfg['rcnn_crop_size'])
         self.use_rcnn = False
@@ -527,6 +533,7 @@ class SANet(nn.Module):
                     fpr_res = get_probability(self.cfg, self.mode, inputs, self.rpn_proposals, self.rcnn_logits,
                                               self.rcnn_deltas)
                     if self.ensemble_proposals.shape[0] == fpr_res.shape[0]:
+                        print("ensemble")
                         self.ensemble_proposals[:, 1] = (self.ensemble_proposals[:, 1] + fpr_res[:, 0]) / 2
             else:
                 self.rcnn_logits = inputs.new_zeros((0, self.cfg['num_class']))

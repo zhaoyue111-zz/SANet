@@ -269,6 +269,7 @@ parser.add_argument('--local-rank', '--local_rank', default=-1, type=int,
                     help='local rank passed by torchrun/torch.distributed.launch')
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend for DDP training')
+parser.add_argument('--use-aspp', action='store_true', help='Enable ASPP3D in the RPN head.')
 
 
 class NullWriter:
@@ -474,7 +475,7 @@ def main():
                             num_workers=args.num_workers, pin_memory=pin_memory, collate_fn=train_collate)
 
     # Initilize network
-    net = getattr(this_module, net)(net_config)
+    net = getattr(this_module, net)(net_config, use_aspp=args.use_aspp)
     net = net.cuda()
 
     start_epoch = 0

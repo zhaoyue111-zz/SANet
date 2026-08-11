@@ -64,7 +64,7 @@ parser.add_argument("--test-set-name", "--test_set_name", dest="test_set_name", 
                     default=None, help="path to the test case list")
 parser.add_argument("--dataset", default=config['dataset'], type=str,
                     help="dataset name under data/, or 'all' for all SANet-ready datasets")
-
+parser.add_argument('--use-aspp', action='store_true', help='Enable ASPP3D in the RPN head.')
 
 def main():
     logging.basicConfig(format='[%(levelname)s][%(asctime)s] %(message)s', level=logging.INFO)
@@ -78,7 +78,7 @@ def main():
 
         cfgs = dataset_configs(args.dataset, skip_missing=(args.dataset == 'all'))
 
-        net = getattr(this_module, net)(config)
+        net = getattr(this_module, net)(config,use_aspp=args.use_aspp)
         net = net.cuda()
 
         if initial_checkpoint:
@@ -99,9 +99,9 @@ def main():
             test_set_name = args.test_set_name or dataset_cfg['test_set_name']
             out_dir = args.out_dir or default_out_dir(args.dataset)
             if args.dataset == 'all':
-                save_dir = os.path.join(out_dir, 'res', str(epoch)+"_pretrained_hardsamples_rcnn40", dataset_cfg['dataset'])
+                save_dir = os.path.join(out_dir, 'res', str(epoch), dataset_cfg['dataset'])
             else:
-                save_dir = os.path.join(out_dir, 'res', str(epoch)+"_pretrained_hardsamples_rcnn40",args.dataset)
+                save_dir = os.path.join(out_dir, 'res', str(epoch)+'_pretrained_hardsamples_rcnn40_PN11_v5_ensemble',args.dataset)
 
             try:
                 dataset = BboxReader(
@@ -145,14 +145,16 @@ def eval(net, dataset, save_dir=None):
             with torch.no_grad():
                 net.forward(input, truth_bboxes, truth_labels)
 
-            # detections = net.rpn_proposals.cpu().numpy() # 进入RCNN的RPN最终 proposal
-            detections = net.detections.cpu().numpy()  # RCNN分类、回归和NMS后的最终检测框
+            # detections = net.rpn_proposals.cpu().numpy()
+            # detections = net.detections.cpu().numpy()  # 开启RCNN
+            detections = net.ensemble_proposals.cpu().numpy()
 
             print('detections', detections.shape)
 
             detections_path = os.path.join(save_dir, '%s_detections.npy' % pid)
             if len(detections):
-                detections = detections[:, 1:-1]
+                # detections = detections[:, 1:-1]
+                detections = detections[:, 1:]
                 np.save(detections_path, detections)
             elif os.path.exists(detections_path):
                 os.remove(detections_path)
@@ -245,5 +247,5 @@ if __name__ == '__main__':
     main()
 
 '''
-python test.py --dataset all --weight /mnt/afs2/code/SANet/train_pretrained_rcnn20/model/best.ckpt --out-dir /mnt/afs2/code/SANet/test_output 
+python test.py --dataset all --weight /mnt/afs2/code/SANet/train_pretrained_hardsamples_rcnn40_PN11_v2/model/best_rcnn.ckpt --out-dir /mnt/afs2/code/SANet/test_output 
 '''
