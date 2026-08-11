@@ -64,15 +64,13 @@ net_config = {
 
     'augtype': {
         'flip': True,
-        'rotate': True,   # 仅小角度平面旋转，见 rotate_angle_range
+        'rotate': False,   # 仅小角度平面旋转，见 rotate_angle_range
         'scale': False,   # Crop.scale 路径较激进，默认关闭
         'swap': False,    # 轴置换对 CT 不自然，保持关闭
         'intensity': True,
         'noise': True,
         'blur': True,
     },
-    # 仅绕轴向(y,x)小角度旋转；过大易把主病灶旋出 crop，且与框同步困难
-    'rotate_angle_range': 10.0,
     'r_rand_crop': 0.2,  # 随机背景 crop 比例，用于增加负样本覆盖
     'intensity_aug': {
         'contrast_range': [0.8, 1.2],
