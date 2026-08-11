@@ -198,7 +198,7 @@ class ASPP3D(nn.Module):
 class RpnHead(nn.Module):
     def __init__(self, config, in_channels=128, use_aspp=False):
         super(RpnHead, self).__init__()
-        self.drop = nn.Dropout3d(p=0.5, inplace=False)
+        self.drop = nn.Dropout3d(p=float(config.get('rpn_dropout', 0.0)), inplace=False)
         self.use_aspp=use_aspp
         self.conv = nn.Sequential(nn.Conv3d(in_channels, 64, kernel_size=1),
                                     nn.ReLU())
@@ -218,6 +218,7 @@ class RpnHead(nn.Module):
         else:
             out = base
 
+        out = self.drop(out)
         logits = self.logits(out)
         deltas = self.deltas(out)
         size = logits.size()
@@ -236,6 +237,7 @@ class RcnnHead(nn.Module):
         super(RcnnHead, self).__init__()
         self.num_class = cfg['num_class']
         self.crop_size = cfg['rcnn_crop_size']
+        self.drop = nn.Dropout(p=float(cfg.get('rcnn_dropout', 0.0)), inplace=False)
 
         self.fc1 = nn.Linear(in_channels * self.crop_size[0] * self.crop_size[1] * self.crop_size[2], 512)
         self.fc2 = nn.Linear(512, 256)
@@ -246,7 +248,7 @@ class RcnnHead(nn.Module):
         x = crops.view(crops.size(0), -1)
         x = F.relu(self.fc1(x), inplace=True)
         x = F.relu(self.fc2(x), inplace=True)
-        # x = F.dropout(x, 0.5, training=self.training)
+        x = self.drop(x)
         logits = self.logit(x)
         deltas = self.delta(x)
 
