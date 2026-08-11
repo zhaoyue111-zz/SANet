@@ -239,6 +239,8 @@ parser.add_argument('--weight-decay', default=train_config['weight_decay'], type
                     metavar='W', help='weight decay (default: 1e-4)')
 parser.add_argument('--epoch-save', default=train_config['epoch_save'], type=int, metavar='S',
                     help='save frequency')
+parser.add_argument('--early-stop-patience', default=train_config.get('early_stop_patience', 40), type=int,
+                    help='Stop if the active FROC metric does not improve for this many epochs. <=0 disables.')
 parser.add_argument('--out-dir', default="train_output", type=str, metavar='OUT',
                     help='directory to save results of this training')
 parser.add_argument('--train-set', default=train_config['train_set_list'], nargs='+', type=str,
@@ -633,7 +635,7 @@ def main():
             best_froc_mean,
             best_rcnn_froc_mean,
         )
-        early_stop_patience = int(train_config.get('early_stop_patience', 0))
+        early_stop_patience = int(args.early_stop_patience)
         early_stop_metric = 'best_rcnn_froc_mean' if i >= epoch_rcnn else 'best_froc_mean'
         should_stop = False
         if early_stop_patience > 0:
