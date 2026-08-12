@@ -110,9 +110,12 @@ class CTBatchDataset(Dataset):
         self.pad_value = cfg['pad_value']
         self.partial_gt_positive_threshold = float(cfg.get('partial_gt_positive_threshold', 0.5))
         self.neg_pos_ratio = _clamp_neg_pos_ratio(cfg.get('train_neg_pos_ratio', 1.0))
+        self.neg_only_batch_ratio = float(cfg.get('ct_neg_only_batch_ratio', 0.1))
+        self.neg_only_batch_ratio = min(1.0, max(0.0, self.neg_only_batch_ratio))
         self.crop = Crop(cfg)
         self.epoch = 0
         self.batch_plan = []
+        self.last_plan_stats = {}
 
         with open(self.set_name, "r") as f:
             self.filenames = [line.strip() for line in f if line.strip()]
@@ -205,22 +208,33 @@ class CTBatchDataset(Dataset):
             raise ValueError("No CT with positive samples for %s" % self.set_name)
 
         # CTs with no positives: FP-only (has hard FP) or pure background.
-        self.neg_only_ct_indices = [
-            i for i in range(len(self.filenames)) if len(self.positives_by_ct[i]) == 0
+        self.fp_only_ct_indices = [
+            i for i in range(len(self.filenames))
+            if len(self.positives_by_ct[i]) == 0 and len(self.hard_fps_by_ct.get(i, [])) > 0
         ]
+        self.pure_bg_ct_indices = [
+            i for i in range(len(self.filenames))
+            if len(self.positives_by_ct[i]) == 0 and len(self.hard_fps_by_ct.get(i, [])) == 0
+        ]
+        self.neg_only_ct_indices = self.fp_only_ct_indices + self.pure_bg_ct_indices
 
         self.n_pos, self.n_neg = split_pos_neg_counts(self.batch_size, self.neg_pos_ratio)
+        self.target_pos_batches = max(
+            1, int(math.ceil(float(self.num_positive_samples) / float(self.n_pos)))
+        )
         self.set_epoch(0)
 
         print(
-            "[%s] CTBatchDataset train cts_pos=%d neg_only_cts=%d positives=%d "
-            "steps/epoch=%d batch=%d (pos=%d,neg=%d) hard_fp=%d"
+            "[%s] CTBatchDataset train cts_pos=%d fp_only=%d pure_bg=%d positives=%d "
+            "target_pos_batches=%d neg_only_ratio=%.3f batch=%d (pos=%d,neg=%d) hard_fp=%d"
             % (
                 self.dataset_name or self.set_name,
                 len(self.pos_ct_indices),
-                len(self.neg_only_ct_indices),
+                len(self.fp_only_ct_indices),
+                len(self.pure_bg_ct_indices),
                 self.num_positive_samples,
-                len(self.batch_plan),
+                self.target_pos_batches,
+                self.neg_only_batch_ratio,
                 self.batch_size,
                 self.n_pos,
                 self.n_neg,
@@ -235,13 +249,26 @@ class CTBatchDataset(Dataset):
         """Rebuild and shuffle the CT-level batch plan for this epoch."""
         self.epoch = int(epoch)
         self.batch_plan = self._build_batch_plan(self.epoch)
+        self.last_plan_stats = self._compute_plan_stats(self.batch_plan)
+        self._print_plan_stats(self.last_plan_stats)
 
-    def _build_batch_plan(self, epoch):
-        rng = np.random.RandomState(int(epoch) * 1000003 + 17)
-        plan = []
+    def _cyclic_take(self, items, count, epoch, rng):
+        """Epoch-dependent shuffle + cyclic window; avoids always taking the head."""
+        if not items or count <= 0:
+            return []
+        order = list(items)
+        rng.shuffle(order)
+        n = len(order)
+        offset = (int(epoch) * int(count)) % n
+        return [order[(offset + i) % n] for i in range(int(count))]
 
-        # Positive CT batches: every GT/hard FN appears >= once; last group may pad.
-        for ct_idx in self.pos_ct_indices:
+    def _make_pos_batch_candidates(self, rng):
+        """All CT-level positive batches for this epoch's per-CT GT shuffle."""
+        candidates = []
+        # Shuffle CT order so candidate list is not always CT0-first.
+        ct_order = list(self.pos_ct_indices)
+        rng.shuffle(ct_order)
+        for ct_idx in ct_order:
             n_src = len(self.positives_by_ct[ct_idx])
             order = np.arange(n_src)
             rng.shuffle(order)
@@ -250,38 +277,122 @@ class CTBatchDataset(Dataset):
                 picks = [(int(j), False) for j in chunk]
                 while len(picks) < self.n_pos:
                     picks.append((int(rng.randint(0, n_src)), True))
-                plan.append({
+                candidates.append({
                     'kind': 'pos',
                     'ct_idx': int(ct_idx),
                     'pos_picks': picks,
                 })
+        return candidates
 
-        # Separate negative-only batches (never mixed into another CT's positive batch).
-        for ct_idx in self.neg_only_ct_indices:
-            hard = self.hard_fps_by_ct.get(ct_idx, [])
-            if hard:
-                order = np.arange(len(hard))
-                rng.shuffle(order)
-                for start in range(0, len(order), self.batch_size):
-                    chunk = order[start:start + self.batch_size]
-                    neg_picks = [('hard', int(j), False) for j in chunk]
-                    while len(neg_picks) < self.batch_size:
-                        neg_picks.append(('hard', int(rng.randint(0, len(hard))), True))
-                    plan.append({
-                        'kind': 'neg_only',
-                        'ct_idx': int(ct_idx),
-                        'neg_picks': neg_picks,
-                    })
-            else:
-                # Pure background CT: one all-random batch per epoch.
-                plan.append({
-                    'kind': 'neg_only',
-                    'ct_idx': int(ct_idx),
-                    'neg_picks': [('rand', None, False) for _ in range(self.batch_size)],
-                })
+    def _make_neg_only_batch(self, ct_idx, rng):
+        hard = self.hard_fps_by_ct.get(ct_idx, [])
+        if hard:
+            order = np.arange(len(hard))
+            rng.shuffle(order)
+            # One batch only: take up to batch_size hard FPs, pad with hard/random.
+            take = min(self.batch_size, len(order))
+            neg_picks = [('hard', int(order[i]), False) for i in range(take)]
+            while len(neg_picks) < self.batch_size:
+                if hard:
+                    neg_picks.append(('hard', int(rng.randint(0, len(hard))), True))
+                else:
+                    neg_picks.append(('rand', None, True))
+        else:
+            neg_picks = [('rand', None, False) for _ in range(self.batch_size)]
+        return {
+            'kind': 'neg_only',
+            'ct_idx': int(ct_idx),
+            'neg_picks': neg_picks,
+        }
+
+    def _build_batch_plan(self, epoch):
+        rng = np.random.RandomState(int(epoch) * 1000003 + 17)
+        plan = []
+
+        # Positive budget ≈ original BboxReader positive exposure.
+        target = self.target_pos_batches
+        candidates = self._make_pos_batch_candidates(rng)
+        n_cand = len(candidates)
+        if n_cand == 0:
+            raise RuntimeError("No positive CT batch candidates")
+        # Cyclic window over shuffled candidates: rotates across epochs.
+        offset = (int(epoch) * int(target)) % n_cand
+        pos_plan = [candidates[(offset + i) % n_cand] for i in range(target)]
+        plan.extend(pos_plan)
+
+        # Few negative-only batches; FP-only preferred over pure background.
+        if self.neg_only_batch_ratio > 0 and self.neg_only_ct_indices:
+            n_neg_only = int(math.ceil(float(target) * self.neg_only_batch_ratio - 1e-12))
+        else:
+            n_neg_only = 0
+        if n_neg_only > 0:
+            n_fp = min(len(self.fp_only_ct_indices), n_neg_only)
+            n_bg = min(len(self.pure_bg_ct_indices), max(0, n_neg_only - n_fp))
+            # Separate rng streams so fp/bg shuffles do not consume the same draws unevenly.
+            fp_rng = np.random.RandomState(int(epoch) * 1000003 + 101)
+            bg_rng = np.random.RandomState(int(epoch) * 1000003 + 202)
+            selected_cts = (
+                self._cyclic_take(self.fp_only_ct_indices, n_fp, epoch, fp_rng)
+                + self._cyclic_take(self.pure_bg_ct_indices, n_bg, epoch, bg_rng)
+            )
+            for ct_idx in selected_cts:
+                plan.append(self._make_neg_only_batch(ct_idx, rng))
 
         rng.shuffle(plan)
         return plan
+
+    def _compute_plan_stats(self, plan):
+        pos_batches = 0
+        neg_only_batches = 0
+        unique_positive_cts = set()
+        positive_slots = 0
+        repeated_positive_slots = 0
+        negative_slots = 0
+
+        for entry in plan:
+            if entry['kind'] == 'pos':
+                pos_batches += 1
+                unique_positive_cts.add(int(entry['ct_idx']))
+                for _pool_i, force_simple in entry['pos_picks']:
+                    positive_slots += 1
+                    if force_simple:
+                        repeated_positive_slots += 1
+                negative_slots += self.n_neg
+            else:
+                neg_only_batches += 1
+                negative_slots += len(entry['neg_picks'])
+
+        ratio = float(negative_slots) / float(max(1, positive_slots))
+        return {
+            'epoch': int(self.epoch),
+            'pos_batches': pos_batches,
+            'neg_only_batches': neg_only_batches,
+            'unique_positive_cts': len(unique_positive_cts),
+            'positive_slots': positive_slots,
+            'repeated_positive_slots': repeated_positive_slots,
+            'negative_slots': negative_slots,
+            'estimated_neg_pos_ratio': ratio,
+            'total_batches': len(plan),
+        }
+
+    def _print_plan_stats(self, stats):
+        print(
+            "[%s] CTBatch plan epoch=%d | pos_batches=%d neg_only_batches=%d "
+            "unique_positive_cts=%d positive_slots=%d repeated_positive_slots=%d "
+            "negative_slots=%d estimated_neg/pos=%.3f total_batches=%d"
+            % (
+                self.dataset_name or self.set_name,
+                stats['epoch'],
+                stats['pos_batches'],
+                stats['neg_only_batches'],
+                stats['unique_positive_cts'],
+                stats['positive_slots'],
+                stats['repeated_positive_slots'],
+                stats['negative_slots'],
+                stats['estimated_neg_pos_ratio'],
+                stats['total_batches'],
+            )
+        )
 
     def load_image(self, filename):
         path = os.path.join(self.data_dir, '%s_zoom.npy' % filename)

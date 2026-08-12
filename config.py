@@ -72,6 +72,8 @@ net_config = {
         'blur': True,
     },
     'r_rand_crop': 0.2,  # 随机背景 crop 比例，用于增加负样本覆盖
+    # --sample-by-ct: 每 epoch negative-only batch 数 ≈ target_pos_batches * ratio
+    'ct_neg_only_batch_ratio': 0.1,
     'intensity_aug': {
         'contrast_range': [0.8, 1.2],
         'brightness_range': [-0.12, 0.12],
