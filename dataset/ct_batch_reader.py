@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""CT-centric batch dataset: one __getitem__ loads one CT and returns a full batch.
+"""CT-centric train batch dataset: one __getitem__ loads one main CT and returns a full batch.
 
-Enabled via train.py --sample-by-ct. Eval/test should keep using BboxReader.
+Enabled via train.py --sample-by-ct (train only). Val/eval/test keep using BboxReader.
 """
 
 from __future__ import annotations
@@ -57,12 +57,38 @@ def split_pos_neg_counts(batch_size, neg_pos_ratio):
     return n_pos, n_neg
 
 
+def sample_pool_indices(pool_size, n):
+    """Sample ``n`` indices from a pool of size ``pool_size``.
+
+    * pool_size >= n: without replacement
+    * pool_size < n: every index once, then with-replacement extras
+      (extras marked force_simple_aug=True)
+
+    Returns list of (pool_index, force_simple_aug).
+    """
+    pool_size = int(pool_size)
+    n = int(n)
+    if pool_size <= 0 or n <= 0:
+        return []
+    if pool_size >= n:
+        chosen = np.random.choice(pool_size, size=n, replace=False)
+        return [(int(j), False) for j in chosen]
+
+    order = np.random.permutation(pool_size)
+    picks = [(int(j), False) for j in order]
+    for _ in range(n - pool_size):
+        picks.append((int(np.random.randint(pool_size)), True))
+    return picks
+
+
 class CTBatchDataset(Dataset):
-    """Each index is one training/val step that yields ``batch_size`` patches from one CT."""
+    """Train-only: each index maps to one main CT and yields ``batch_size`` patches."""
 
     def __init__(self, data_dir, set_name, cfg, mode='train', batch_size=8):
-        if mode not in ('train', 'val'):
-            raise ValueError("CTBatchDataset only supports mode train/val, got %s" % mode)
+        if mode != 'train':
+            raise ValueError(
+                "CTBatchDataset is train-only (val must use BboxReader); got mode=%s" % mode
+            )
         self.mode = mode
         self.cfg = cfg
         self.batch_size = int(batch_size)
@@ -73,8 +99,6 @@ class CTBatchDataset(Dataset):
         self.pad_value = cfg['pad_value']
         self.partial_gt_positive_threshold = float(cfg.get('partial_gt_positive_threshold', 0.5))
         self.neg_pos_ratio = _clamp_neg_pos_ratio(cfg.get('train_neg_pos_ratio', 1.0))
-        # N2: random-bg pool size; default max(16, 2 * n_neg) when unset / <=0
-        self.ct_neg_pool_size = int(cfg.get('ct_neg_pool_size', 0) or 0)
         self.crop = Crop(cfg)
 
         with open(self.set_name, "r") as f:
@@ -105,11 +129,7 @@ class CTBatchDataset(Dataset):
         if not self.filenames:
             raise ValueError("No available preprocessed images for %s" % self.set_name)
 
-        if mode == 'train':
-            csv_dir = cfg['train_anno']
-        else:
-            csv_dir = cfg.get('val_anno', cfg['train_anno'])
-
+        csv_dir = cfg['train_anno']
         annos_all = pd.read_csv(csv_dir)
         filename_to_idx = {}
         for i, fn in enumerate(self.filenames):
@@ -133,16 +153,15 @@ class CTBatchDataset(Dataset):
             labels.append(l)
         self.sample_bboxes = labels
 
-        # Positive patch sources: GT (+ hard FN in train), same as BboxReader.
+        # Positive patch sources: GT + hard FN (same as BboxReader).
         self.bboxes = []
         for i, l in enumerate(labels):
             if len(l) > 0:
                 for t in l:
                     self.bboxes.append([np.concatenate([[i], t])])
-        if self.mode == 'train':
-            hard_fns = _load_hard_fns(cfg.get('hard_fn_csv'), self.dataset_name, filename_to_idx)
-            for sample in hard_fns:
-                self.bboxes.append([sample])
+        hard_fns = _load_hard_fns(cfg.get('hard_fn_csv'), self.dataset_name, filename_to_idx)
+        for sample in hard_fns:
+            self.bboxes.append([sample])
         if not self.bboxes:
             raise ValueError(
                 "No annotated boxes found for %s split %s"
@@ -152,46 +171,50 @@ class CTBatchDataset(Dataset):
         self.num_positive_samples = len(self.bboxes)
 
         self.hard_fps_by_ct = {i: [] for i in range(len(self.filenames))}
-        if self.mode == 'train':
-            hard_fps = _load_hard_fps(
-                cfg.get('hard_fp_csv'),
-                self.dataset_name,
-                filename_to_idx,
-                float(cfg.get('hard_fp_threshold', 0.9)),
-            )
-            for fp in hard_fps:
-                ct_idx = int(fp[0])
-                if 0 <= ct_idx < len(self.filenames):
-                    self.hard_fps_by_ct[ct_idx].append(np.asarray(fp[1:4], dtype=np.float32))
+        hard_fps = _load_hard_fps(
+            cfg.get('hard_fp_csv'),
+            self.dataset_name,
+            filename_to_idx,
+            float(cfg.get('hard_fp_threshold', 0.9)),
+        )
+        for fp in hard_fps:
+            ct_idx = int(fp[0])
+            if 0 <= ct_idx < len(self.filenames):
+                self.hard_fps_by_ct[ct_idx].append(np.asarray(fp[1:4], dtype=np.float32))
+        # Flat list for cross-CT hard-FP fill (covers FP-only CTs).
+        self.hard_fp_list = []
+        for ct_idx, centers in self.hard_fps_by_ct.items():
+            for center in centers:
+                self.hard_fp_list.append((ct_idx, center))
 
         self.positives_by_ct = {i: [] for i in range(len(self.filenames))}
         for row in self.bboxes:
             ct_idx = int(row[0])
             self.positives_by_ct[ct_idx].append(np.asarray(row[1:7], dtype=np.float32))
 
-        # Only CTs with at least one positive sample.
-        self.ct_indices = [i for i, boxes in self.positives_by_ct.items() if len(boxes) > 0]
-        if not self.ct_indices:
+        # Main CT for a batch: must have >=1 positive. Random-bg may use any CT.
+        self.pos_ct_indices = [i for i, boxes in self.positives_by_ct.items() if len(boxes) > 0]
+        if not self.pos_ct_indices:
             raise ValueError("No CT with positive samples for %s" % self.set_name)
+        self.all_ct_indices = list(range(len(self.filenames)))
 
-        self.epoch_steps = max(1, int(math.ceil(float(self.num_positive_samples) / float(self.batch_size))))
         self.n_pos, self.n_neg = split_pos_neg_counts(self.batch_size, self.neg_pos_ratio)
-        if self.ct_neg_pool_size <= 0:
-            self.ct_neg_pool_size = max(16, 2 * self.n_neg)
+        # Match BboxReader positive exposure: ~num_positive_samples positives / epoch.
+        self.epoch_steps = max(1, int(math.ceil(float(self.num_positive_samples) / float(self.n_pos))))
 
         print(
-            "[%s] CTBatchDataset mode=%s cts=%d positives=%d steps/epoch=%d "
-            "batch=%d (pos=%d,neg=%d) hard_fp_cts=%d"
+            "[%s] CTBatchDataset train cts_pos=%d/%d positives=%d steps/epoch=%d "
+            "batch=%d (pos=%d,neg=%d) hard_fp=%d"
             % (
                 self.dataset_name or self.set_name,
-                self.mode,
-                len(self.ct_indices),
+                len(self.pos_ct_indices),
+                len(self.filenames),
                 self.num_positive_samples,
                 self.epoch_steps,
                 self.batch_size,
                 self.n_pos,
                 self.n_neg,
-                sum(1 for v in self.hard_fps_by_ct.values() if len(v) > 0),
+                len(self.hard_fp_list),
             )
         )
 
@@ -213,8 +236,24 @@ class CTBatchDataset(Dataset):
             % (self.dataset_name or 'unknown', self.mode, filename, path, size)
         ) from last_exc
 
+    def _enabled_simple_augs(self):
+        """Simple-aug choices that are enabled in augtype (closed ones never run)."""
+        choices = []
+        if self.augtype.get('flip', False):
+            choices.append('flip')
+        if self.augtype.get('rotate', False):
+            choices.append('rotate')
+        if self.augtype.get('intensity', False):
+            choices.append('intensity')
+        if self.augtype.get('noise', False):
+            choices.append('noise')
+        return choices
+
     def _apply_simple_aug(self, sample, target, bboxes):
-        choice = random.choice(['flip', 'rotate', 'intensity', 'noise'])
+        choices = self._enabled_simple_augs()
+        if not choices:
+            return sample, target, bboxes
+        choice = random.choice(choices)
         if choice == 'flip':
             sample, target, bboxes = augment(
                 sample, target, bboxes,
@@ -242,8 +281,6 @@ class CTBatchDataset(Dataset):
         return sample, target, bboxes
 
     def _apply_full_aug(self, sample, target, bboxes, is_random_crop):
-        if self.mode != 'train':
-            return sample, target, bboxes
         if not is_random_crop:
             sample, target, bboxes = augment(
                 sample, target, bboxes,
@@ -276,8 +313,8 @@ class CTBatchDataset(Dataset):
     def _crop_positive(self, imgs, ct_idx, lesion_box):
         lesion_box = np.asarray(lesion_box, dtype=np.float32)
         all_boxes = np.asarray(self.sample_bboxes[ct_idx], dtype=np.float32).reshape(-1, 6)
-        is_scale = self.augtype.get('scale', False) and (self.mode == 'train')
-        allow_large = self.mode == 'train' and bool(self.cfg.get('large_lesion_resize', True))
+        is_scale = self.augtype.get('scale', False)
+        allow_large = bool(self.cfg.get('large_lesion_resize', True))
         sample, target, bboxes, _coord = self.crop(
             imgs, lesion_box, all_boxes,
             isScale=is_scale, isRand=False, allow_large_lesion_resize=allow_large,
@@ -305,54 +342,81 @@ class CTBatchDataset(Dataset):
         sample, target, bboxes = self._apply_full_aug(sample, target, bboxes, is_random_crop)
         return self._finalize_sample(sample, bboxes)
 
-    def _sample_with_replacement(self, pool_size, n):
-        """Return list of (pool_index, force_simple_aug).
+    def _plan_negative_specs(self, main_ct_idx):
+        """Hard-FP-first negatives; leftover slots are on-demand random backgrounds.
 
-        S2a simple-aug is applied only on forced extras when pool_size < n (R1).
+        When n_neg >= 2, reserve at least one random-bg slot so hard FP does not
+        consume the entire negative budget. Extra hard FPs may come from other CTs
+        (including FP-only volumes) after the main CT pool is used.
         """
-        if pool_size <= 0 or n <= 0:
+        n_neg = self.n_neg
+        if n_neg <= 0:
             return []
-        picks = []
-        for i in range(n):
-            j = int(np.random.randint(pool_size))
-            force_simple = (pool_size < n) and (i >= pool_size)
-            picks.append((j, force_simple))
-        return picks
+
+        reserve_rand = 1 if n_neg >= 2 else 0
+        hard_budget = n_neg - reserve_rand
+        specs = []  # ('hard', ct_idx, center, force_simple) | ('rand', ct_idx, None, False)
+
+        main_fps = self.hard_fps_by_ct.get(main_ct_idx, [])
+        main_take = min(hard_budget, len(main_fps))
+        for pool_i, force_simple in sample_pool_indices(len(main_fps), main_take):
+            specs.append(('hard', main_ct_idx, main_fps[pool_i], force_simple))
+
+        remaining_hard = hard_budget - len(specs)
+        if remaining_hard > 0 and self.hard_fp_list:
+            others = [(ct, cen) for ct, cen in self.hard_fp_list if ct != main_ct_idx]
+            if others:
+                for pool_i, force_simple in sample_pool_indices(len(others), remaining_hard):
+                    ct_i, center = others[pool_i]
+                    specs.append(('hard', ct_i, center, force_simple))
+
+        n_rand = n_neg - len(specs)
+        for _ in range(n_rand):
+            bg_ct = int(self.all_ct_indices[np.random.randint(len(self.all_ct_indices))])
+            specs.append(('rand', bg_ct, None, False))
+        return specs
 
     def __getitem__(self, index):
-        # index only defines epoch step identity; CT is chosen uniformly.
-        t = time.time()
-        np.random.seed(int(str(t % 1)[2:7]) ^ int(index) ^ os.getpid())
+        # Stable main-CT mapping for DDP: shuffled indices still partition CTs across ranks.
+        index = int(index)
+        main_ct_idx = int(self.pos_ct_indices[index % len(self.pos_ct_indices)])
+        # Patch-level randomness; CT choice itself is index-determined.
+        rng_seed = (index + 1) * 1000003 ^ (os.getpid() * 9176) ^ (id(self) & 0xFFFF)
+        np.random.seed(rng_seed % (2 ** 32 - 1))
+        random.seed(rng_seed % (2 ** 32 - 1))
 
-        ct_idx = int(self.ct_indices[np.random.randint(len(self.ct_indices))])
-        filename = self.filenames[ct_idx]
-        imgs = self.load_image(filename)
+        volume_cache = {}
 
-        pos_pool = self.positives_by_ct[ct_idx]
-        pos_picks = self._sample_with_replacement(len(pos_pool), self.n_pos)
+        def get_volume(ct_i):
+            if ct_i not in volume_cache:
+                volume_cache[ct_i] = self.load_image(self.filenames[ct_i])
+            return volume_cache[ct_i]
 
-        # Neg pool = hard FPs ∪ pre-generated K random backgrounds (N2).
-        neg_crops = []
-        for center in self.hard_fps_by_ct.get(ct_idx, []):
-            neg_crops.append(self._crop_hard_fp(imgs, ct_idx, center))
-        k_rand = max(self.ct_neg_pool_size, self.n_neg)
-        for _ in range(k_rand):
-            neg_crops.append(self._crop_random_bg(imgs, ct_idx))
-        neg_picks = self._sample_with_replacement(len(neg_crops), self.n_neg)
+        main_imgs = get_volume(main_ct_idx)
+        pos_pool = self.positives_by_ct[main_ct_idx]
+        pos_picks = sample_pool_indices(len(pos_pool), self.n_pos)
+        neg_specs = self._plan_negative_specs(main_ct_idx)
 
         samples = []
         for pool_i, force_simple in pos_picks:
-            crop = self._crop_positive(imgs, ct_idx, pos_pool[pool_i])
+            crop = self._crop_positive(main_imgs, main_ct_idx, pos_pool[pool_i])
             samples.append(self._assemble_from_crop(*crop, force_simple_aug=force_simple))
-        for pool_i, force_simple in neg_picks:
-            samples.append(self._assemble_from_crop(*neg_crops[pool_i], force_simple_aug=force_simple))
+
+        for kind, ct_i, center, force_simple in neg_specs:
+            imgs = get_volume(ct_i)
+            if kind == 'hard':
+                crop = self._crop_hard_fp(imgs, ct_i, center)
+            else:
+                crop = self._crop_random_bg(imgs, ct_i)
+            samples.append(self._assemble_from_crop(*crop, force_simple_aug=force_simple))
 
         random.shuffle(samples)
         return samples
 
 
-def build_ct_batch_datasets(dataset_name, split, batch_size, hard_fp_csv=None, hard_fn_csv=None,
+def build_ct_batch_datasets(dataset_name, batch_size, hard_fp_csv=None, hard_fn_csv=None,
                             hard_fp_threshold=0.9, train_neg_pos_ratio=1.0):
+    """Build train-only CTBatchDataset (or ConcatDataset for dataset=all)."""
     from config import dataset_configs
     from torch.utils.data import ConcatDataset
 
@@ -360,38 +424,28 @@ def build_ct_batch_datasets(dataset_name, split, batch_size, hard_fp_csv=None, h
     datasets = []
     for dataset_cfg in cfgs:
         dataset_cfg = dict(dataset_cfg)
-        if split == 'train':
-            dataset_cfg.update({
-                'hard_fp_csv': hard_fp_csv,
-                'hard_fn_csv': hard_fn_csv,
-                'hard_fp_threshold': hard_fp_threshold,
-                'train_neg_pos_ratio': train_neg_pos_ratio,
-            })
-            set_name = dataset_cfg['train_set_list']
-            mode = 'train'
-        elif split == 'val':
-            # Val uses same ratio for pos/neg split inside each CT batch.
-            dataset_cfg['train_neg_pos_ratio'] = train_neg_pos_ratio
-            set_name = dataset_cfg['val_set_list']
-            mode = 'val'
-        else:
-            raise ValueError("Unsupported split: %s" % split)
+        dataset_cfg.update({
+            'hard_fp_csv': hard_fp_csv,
+            'hard_fn_csv': hard_fn_csv,
+            'hard_fp_threshold': hard_fp_threshold,
+            'train_neg_pos_ratio': train_neg_pos_ratio,
+        })
         try:
             datasets.append(
                 CTBatchDataset(
                     dataset_cfg['DATA_DIR'],
-                    set_name,
+                    dataset_cfg['train_set_list'],
                     dataset_cfg,
-                    mode=mode,
+                    mode='train',
                     batch_size=batch_size,
                 )
             )
         except (FileNotFoundError, ValueError) as exc:
             if dataset_name != 'all':
                 raise
-            print("[%s] Skip %s split: %s" % (dataset_cfg['dataset'], split, exc))
+            print("[%s] Skip train split: %s" % (dataset_cfg['dataset'], exc))
     if not datasets:
-        raise ValueError("No usable CTBatchDataset for %s split in dataset=%s" % (split, dataset_name))
+        raise ValueError("No usable CTBatchDataset for train in dataset=%s" % dataset_name)
     if len(datasets) == 1:
         return datasets[0]
     return ConcatDataset(datasets)

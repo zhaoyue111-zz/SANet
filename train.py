@@ -269,8 +269,8 @@ parser.add_argument('--hard-fp-threshold', default=0.9, type=float,
 parser.add_argument('--train-neg-pos-ratio', default=net_config.get('train_neg_pos_ratio', 1.0), type=float,
                     help='Negative/positive sample ratio per training epoch. Clamped to [1/3, 1].')
 parser.add_argument('--sample-by-ct', action='store_true',
-                    help='Train/val: one DataLoader item = full batch from one CT (load volume once). '
-                         'Eval/test keep BboxReader.')
+                    help='Train only: one DataLoader item = full batch from one main CT '
+                         '(load primary volume once). Val/eval/test keep BboxReader.')
 parser.add_argument('--local-rank', '--local_rank', default=-1, type=int,
                     help='local rank passed by torchrun/torch.distributed.launch')
 parser.add_argument('--dist-backend', default='nccl', type=str,
@@ -463,19 +463,14 @@ def main():
     if args.sample_by_ct:
         train_dataset = build_ct_batch_datasets(
             args.dataset,
-            'train',
             batch_size=batch_size,
             hard_fp_csv=args.hard_fp_csv,
             hard_fn_csv=args.hard_fn_csv,
             hard_fp_threshold=args.hard_fp_threshold,
             train_neg_pos_ratio=args.train_neg_pos_ratio,
         )
-        val_dataset = build_ct_batch_datasets(
-            args.dataset,
-            'val',
-            batch_size=batch_size,
-            train_neg_pos_ratio=args.train_neg_pos_ratio,
-        )
+        # Val must stay on BboxReader so FROC / early-stop metrics stay comparable.
+        val_dataset = build_split_dataset(args.dataset, 'val')
     else:
         train_dataset = build_split_dataset(
             args.dataset,
@@ -495,18 +490,24 @@ def main():
     val_sampler = DistributedSampler(val_dataset, num_replicas=args.world_size, rank=args.rank, shuffle=False) \
         if args.distributed else None
     if args.sample_by_ct:
-        # Each dataset item already contains ``batch_size`` patches from one CT.
-        loader_batch_size = 1
-        collate_fn = ct_batch_collate
+        # Each train item already contains ``batch_size`` patches from one main CT.
+        train_loader = DataLoader(train_dataset, batch_size=1, shuffle=(train_sampler is None),
+                                  sampler=train_sampler,
+                                  num_workers=args.num_workers, pin_memory=pin_memory,
+                                  collate_fn=ct_batch_collate)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                                sampler=val_sampler,
+                                num_workers=args.num_workers, pin_memory=pin_memory,
+                                collate_fn=train_collate)
     else:
-        loader_batch_size = batch_size
-        collate_fn = train_collate
-    train_loader = DataLoader(train_dataset, batch_size=loader_batch_size, shuffle=(train_sampler is None),
-                              sampler=train_sampler,
-                              num_workers=args.num_workers, pin_memory=pin_memory, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=loader_batch_size, shuffle=False,
-                            sampler=val_sampler,
-                            num_workers=args.num_workers, pin_memory=pin_memory, collate_fn=collate_fn)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=(train_sampler is None),
+                                  sampler=train_sampler,
+                                  num_workers=args.num_workers, pin_memory=pin_memory,
+                                  collate_fn=train_collate)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                                sampler=val_sampler,
+                                num_workers=args.num_workers, pin_memory=pin_memory,
+                                collate_fn=train_collate)
 
     # Initilize network
     net = getattr(this_module, net)(net_config, use_aspp=args.use_aspp)

@@ -9,6 +9,12 @@
 train_output/
 test_output/
 
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
 # Medical image data
 data/*/full/*.npy
 
