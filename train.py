@@ -20,7 +20,7 @@ from net.sanet import SANet
 import time
 from dataset.collate import train_collate, test_collate, eval_collate, ct_batch_collate
 from dataset.bbox_reader import BboxReader
-from dataset.ct_batch_reader import build_ct_batch_datasets
+from dataset.ct_batch_reader import build_ct_batch_datasets, set_ct_batch_epoch
 from utils.util import Logger
 from config import (
     train_config, data_config, net_config, config,
@@ -609,6 +609,9 @@ def main():
     for i in tqdm(range(start_epoch, epochs + 1), desc='Total', disable=not is_main_process(args)):
         if train_sampler is not None:
             train_sampler.set_epoch(i)
+        if args.sample_by_ct:
+            # Rebuild/shuffle CT batch_plan before DataLoader workers pickle the dataset.
+            set_ct_batch_epoch(train_dataset, i)
         # learning rate schedule
         if isinstance(optimizer, torch.optim.SGD):
             base_lr = lr_schdule(i, init_lr=init_lr, total=epochs)

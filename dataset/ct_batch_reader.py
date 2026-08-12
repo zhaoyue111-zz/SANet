@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CT-centric train batch dataset: one __getitem__ loads one main CT and returns a full batch.
+"""CT-centric train batch dataset: one __getitem__ loads one CT and returns a full batch.
 
 Enabled via train.py --sample-by-ct (train only). Val/eval/test keep using BboxReader.
 """
@@ -14,7 +14,7 @@ import time
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import ConcatDataset, Dataset, Subset
 
 from dataset.bbox_reader import (
     Crop,
@@ -81,8 +81,19 @@ def sample_pool_indices(pool_size, n):
     return picks
 
 
+def set_ct_batch_epoch(dataset, epoch):
+    """Rebuild CT batch plans for CTBatchDataset (including Concat/Subset wrappers)."""
+    if isinstance(dataset, CTBatchDataset):
+        dataset.set_epoch(int(epoch))
+    elif isinstance(dataset, ConcatDataset):
+        for sub in dataset.datasets:
+            set_ct_batch_epoch(sub, epoch)
+    elif isinstance(dataset, Subset):
+        set_ct_batch_epoch(dataset.dataset, epoch)
+
+
 class CTBatchDataset(Dataset):
-    """Train-only: each index maps to one main CT and yields ``batch_size`` patches."""
+    """Train-only: each index is one pre-planned single-CT batch."""
 
     def __init__(self, data_dir, set_name, cfg, mode='train', batch_size=8):
         if mode != 'train':
@@ -100,6 +111,8 @@ class CTBatchDataset(Dataset):
         self.partial_gt_positive_threshold = float(cfg.get('partial_gt_positive_threshold', 0.5))
         self.neg_pos_ratio = _clamp_neg_pos_ratio(cfg.get('train_neg_pos_ratio', 1.0))
         self.crop = Crop(cfg)
+        self.epoch = 0
+        self.batch_plan = []
 
         with open(self.set_name, "r") as f:
             self.filenames = [line.strip() for line in f if line.strip()]
@@ -181,45 +194,94 @@ class CTBatchDataset(Dataset):
             ct_idx = int(fp[0])
             if 0 <= ct_idx < len(self.filenames):
                 self.hard_fps_by_ct[ct_idx].append(np.asarray(fp[1:4], dtype=np.float32))
-        # Flat list for cross-CT hard-FP fill (covers FP-only CTs).
-        self.hard_fp_list = []
-        for ct_idx, centers in self.hard_fps_by_ct.items():
-            for center in centers:
-                self.hard_fp_list.append((ct_idx, center))
 
         self.positives_by_ct = {i: [] for i in range(len(self.filenames))}
         for row in self.bboxes:
             ct_idx = int(row[0])
             self.positives_by_ct[ct_idx].append(np.asarray(row[1:7], dtype=np.float32))
 
-        # Main CT for a batch: must have >=1 positive. Random-bg may use any CT.
         self.pos_ct_indices = [i for i, boxes in self.positives_by_ct.items() if len(boxes) > 0]
         if not self.pos_ct_indices:
             raise ValueError("No CT with positive samples for %s" % self.set_name)
-        self.all_ct_indices = list(range(len(self.filenames)))
+
+        # CTs with no positives: FP-only (has hard FP) or pure background.
+        self.neg_only_ct_indices = [
+            i for i in range(len(self.filenames)) if len(self.positives_by_ct[i]) == 0
+        ]
 
         self.n_pos, self.n_neg = split_pos_neg_counts(self.batch_size, self.neg_pos_ratio)
-        # Match BboxReader positive exposure: ~num_positive_samples positives / epoch.
-        self.epoch_steps = max(1, int(math.ceil(float(self.num_positive_samples) / float(self.n_pos))))
+        self.set_epoch(0)
 
         print(
-            "[%s] CTBatchDataset train cts_pos=%d/%d positives=%d steps/epoch=%d "
-            "batch=%d (pos=%d,neg=%d) hard_fp=%d"
+            "[%s] CTBatchDataset train cts_pos=%d neg_only_cts=%d positives=%d "
+            "steps/epoch=%d batch=%d (pos=%d,neg=%d) hard_fp=%d"
             % (
                 self.dataset_name or self.set_name,
                 len(self.pos_ct_indices),
-                len(self.filenames),
+                len(self.neg_only_ct_indices),
                 self.num_positive_samples,
-                self.epoch_steps,
+                len(self.batch_plan),
                 self.batch_size,
                 self.n_pos,
                 self.n_neg,
-                len(self.hard_fp_list),
+                sum(len(v) for v in self.hard_fps_by_ct.values()),
             )
         )
 
     def __len__(self):
-        return self.epoch_steps
+        return len(self.batch_plan)
+
+    def set_epoch(self, epoch):
+        """Rebuild and shuffle the CT-level batch plan for this epoch."""
+        self.epoch = int(epoch)
+        self.batch_plan = self._build_batch_plan(self.epoch)
+
+    def _build_batch_plan(self, epoch):
+        rng = np.random.RandomState(int(epoch) * 1000003 + 17)
+        plan = []
+
+        # Positive CT batches: every GT/hard FN appears >= once; last group may pad.
+        for ct_idx in self.pos_ct_indices:
+            n_src = len(self.positives_by_ct[ct_idx])
+            order = np.arange(n_src)
+            rng.shuffle(order)
+            for start in range(0, n_src, self.n_pos):
+                chunk = order[start:start + self.n_pos]
+                picks = [(int(j), False) for j in chunk]
+                while len(picks) < self.n_pos:
+                    picks.append((int(rng.randint(0, n_src)), True))
+                plan.append({
+                    'kind': 'pos',
+                    'ct_idx': int(ct_idx),
+                    'pos_picks': picks,
+                })
+
+        # Separate negative-only batches (never mixed into another CT's positive batch).
+        for ct_idx in self.neg_only_ct_indices:
+            hard = self.hard_fps_by_ct.get(ct_idx, [])
+            if hard:
+                order = np.arange(len(hard))
+                rng.shuffle(order)
+                for start in range(0, len(order), self.batch_size):
+                    chunk = order[start:start + self.batch_size]
+                    neg_picks = [('hard', int(j), False) for j in chunk]
+                    while len(neg_picks) < self.batch_size:
+                        neg_picks.append(('hard', int(rng.randint(0, len(hard))), True))
+                    plan.append({
+                        'kind': 'neg_only',
+                        'ct_idx': int(ct_idx),
+                        'neg_picks': neg_picks,
+                    })
+            else:
+                # Pure background CT: one all-random batch per epoch.
+                plan.append({
+                    'kind': 'neg_only',
+                    'ct_idx': int(ct_idx),
+                    'neg_picks': [('rand', None, False) for _ in range(self.batch_size)],
+                })
+
+        rng.shuffle(plan)
+        return plan
 
     def load_image(self, filename):
         path = os.path.join(self.data_dir, '%s_zoom.npy' % filename)
@@ -342,73 +404,62 @@ class CTBatchDataset(Dataset):
         sample, target, bboxes = self._apply_full_aug(sample, target, bboxes, is_random_crop)
         return self._finalize_sample(sample, bboxes)
 
-    def _plan_negative_specs(self, main_ct_idx):
-        """Hard-FP-first negatives; leftover slots are on-demand random backgrounds.
-
-        When n_neg >= 2, reserve at least one random-bg slot so hard FP does not
-        consume the entire negative budget. Extra hard FPs may come from other CTs
-        (including FP-only volumes) after the main CT pool is used.
-        """
+    def _plan_negatives_same_ct(self, ct_idx):
+        """Hard-FP-first negatives from the current CT only; fill with same-CT random crops."""
         n_neg = self.n_neg
         if n_neg <= 0:
             return []
 
         reserve_rand = 1 if n_neg >= 2 else 0
         hard_budget = n_neg - reserve_rand
-        specs = []  # ('hard', ct_idx, center, force_simple) | ('rand', ct_idx, None, False)
+        hard = self.hard_fps_by_ct.get(ct_idx, [])
+        specs = []  # ('hard', center, force_simple) | ('rand', None, False)
 
-        main_fps = self.hard_fps_by_ct.get(main_ct_idx, [])
-        main_take = min(hard_budget, len(main_fps))
-        for pool_i, force_simple in sample_pool_indices(len(main_fps), main_take):
-            specs.append(('hard', main_ct_idx, main_fps[pool_i], force_simple))
+        take = min(hard_budget, len(hard))
+        for pool_i, force_simple in sample_pool_indices(len(hard), take):
+            specs.append(('hard', hard[pool_i], force_simple))
 
-        remaining_hard = hard_budget - len(specs)
-        if remaining_hard > 0 and self.hard_fp_list:
-            others = [(ct, cen) for ct, cen in self.hard_fp_list if ct != main_ct_idx]
-            if others:
-                for pool_i, force_simple in sample_pool_indices(len(others), remaining_hard):
-                    ct_i, center = others[pool_i]
-                    specs.append(('hard', ct_i, center, force_simple))
-
-        n_rand = n_neg - len(specs)
-        for _ in range(n_rand):
-            bg_ct = int(self.all_ct_indices[np.random.randint(len(self.all_ct_indices))])
-            specs.append(('rand', bg_ct, None, False))
+        while len(specs) < n_neg:
+            specs.append(('rand', None, False))
         return specs
 
     def __getitem__(self, index):
-        # Stable main-CT mapping for DDP: shuffled indices still partition CTs across ranks.
         index = int(index)
-        main_ct_idx = int(self.pos_ct_indices[index % len(self.pos_ct_indices)])
-        # Patch-level randomness; CT choice itself is index-determined.
-        rng_seed = (index + 1) * 1000003 ^ (os.getpid() * 9176) ^ (id(self) & 0xFFFF)
+        entry = self.batch_plan[index]
+        ct_idx = int(entry['ct_idx'])
+
+        # Patch-level randomness; CT + positive indices come from the plan.
+        rng_seed = (
+            (self.epoch + 1) * 1000003
+            ^ (index + 1) * 9176
+            ^ (os.getpid() * 13)
+        )
         np.random.seed(rng_seed % (2 ** 32 - 1))
         random.seed(rng_seed % (2 ** 32 - 1))
 
-        volume_cache = {}
-
-        def get_volume(ct_i):
-            if ct_i not in volume_cache:
-                volume_cache[ct_i] = self.load_image(self.filenames[ct_i])
-            return volume_cache[ct_i]
-
-        main_imgs = get_volume(main_ct_idx)
-        pos_pool = self.positives_by_ct[main_ct_idx]
-        pos_picks = sample_pool_indices(len(pos_pool), self.n_pos)
-        neg_specs = self._plan_negative_specs(main_ct_idx)
-
+        # One CT load for the whole batch.
+        imgs = self.load_image(self.filenames[ct_idx])
         samples = []
-        for pool_i, force_simple in pos_picks:
-            crop = self._crop_positive(main_imgs, main_ct_idx, pos_pool[pool_i])
-            samples.append(self._assemble_from_crop(*crop, force_simple_aug=force_simple))
 
-        for kind, ct_i, center, force_simple in neg_specs:
-            imgs = get_volume(ct_i)
-            if kind == 'hard':
-                crop = self._crop_hard_fp(imgs, ct_i, center)
-            else:
-                crop = self._crop_random_bg(imgs, ct_i)
-            samples.append(self._assemble_from_crop(*crop, force_simple_aug=force_simple))
+        if entry['kind'] == 'pos':
+            pos_pool = self.positives_by_ct[ct_idx]
+            for pool_i, force_simple in entry['pos_picks']:
+                crop = self._crop_positive(imgs, ct_idx, pos_pool[pool_i])
+                samples.append(self._assemble_from_crop(*crop, force_simple_aug=force_simple))
+            for kind, center, force_simple in self._plan_negatives_same_ct(ct_idx):
+                if kind == 'hard':
+                    crop = self._crop_hard_fp(imgs, ct_idx, center)
+                else:
+                    crop = self._crop_random_bg(imgs, ct_idx)
+                samples.append(self._assemble_from_crop(*crop, force_simple_aug=force_simple))
+        else:
+            hard = self.hard_fps_by_ct.get(ct_idx, [])
+            for kind, hard_i, force_simple in entry['neg_picks']:
+                if kind == 'hard':
+                    crop = self._crop_hard_fp(imgs, ct_idx, hard[hard_i])
+                else:
+                    crop = self._crop_random_bg(imgs, ct_idx)
+                samples.append(self._assemble_from_crop(*crop, force_simple_aug=force_simple))
 
         random.shuffle(samples)
         return samples
@@ -418,7 +469,6 @@ def build_ct_batch_datasets(dataset_name, batch_size, hard_fp_csv=None, hard_fn_
                             hard_fp_threshold=0.9, train_neg_pos_ratio=1.0):
     """Build train-only CTBatchDataset (or ConcatDataset for dataset=all)."""
     from config import dataset_configs
-    from torch.utils.data import ConcatDataset
 
     cfgs = dataset_configs(dataset_name, skip_missing=(dataset_name == 'all'))
     datasets = []
