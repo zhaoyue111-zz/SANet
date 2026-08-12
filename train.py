@@ -18,8 +18,9 @@ preset_cuda_visible_devices()
 
 from net.sanet import SANet
 import time
-from dataset.collate import train_collate, test_collate, eval_collate
+from dataset.collate import train_collate, test_collate, eval_collate, ct_batch_collate
 from dataset.bbox_reader import BboxReader
+from dataset.ct_batch_reader import build_ct_batch_datasets
 from utils.util import Logger
 from config import (
     train_config, data_config, net_config, config,
@@ -267,6 +268,9 @@ parser.add_argument('--hard-fp-threshold', default=0.9, type=float,
                     help='Minimum FP probability used by --hard-fp-csv. Default: 0.9.')
 parser.add_argument('--train-neg-pos-ratio', default=net_config.get('train_neg_pos_ratio', 1.0), type=float,
                     help='Negative/positive sample ratio per training epoch. Clamped to [1/3, 1].')
+parser.add_argument('--sample-by-ct', action='store_true',
+                    help='Train/val: one DataLoader item = full batch from one CT (load volume once). '
+                         'Eval/test keep BboxReader.')
 parser.add_argument('--local-rank', '--local_rank', default=-1, type=int,
                     help='local rank passed by torchrun/torch.distributed.launch')
 parser.add_argument('--dist-backend', default='nccl', type=str,
@@ -456,15 +460,32 @@ def main():
     epoch_rcnn = args.epoch_rcnn
     batch_size = args.batch_size
     lr_schdule = train_config['lr_schedule']
-    train_dataset = build_split_dataset(
-        args.dataset,
-        'train',
-        hard_fp_csv=args.hard_fp_csv,
-        hard_fn_csv=args.hard_fn_csv,
-        hard_fp_threshold=args.hard_fp_threshold,
-        train_neg_pos_ratio=args.train_neg_pos_ratio,
-    )
-    val_dataset = build_split_dataset(args.dataset, 'val')
+    if args.sample_by_ct:
+        train_dataset = build_ct_batch_datasets(
+            args.dataset,
+            'train',
+            batch_size=batch_size,
+            hard_fp_csv=args.hard_fp_csv,
+            hard_fn_csv=args.hard_fn_csv,
+            hard_fp_threshold=args.hard_fp_threshold,
+            train_neg_pos_ratio=args.train_neg_pos_ratio,
+        )
+        val_dataset = build_ct_batch_datasets(
+            args.dataset,
+            'val',
+            batch_size=batch_size,
+            train_neg_pos_ratio=args.train_neg_pos_ratio,
+        )
+    else:
+        train_dataset = build_split_dataset(
+            args.dataset,
+            'train',
+            hard_fp_csv=args.hard_fp_csv,
+            hard_fn_csv=args.hard_fn_csv,
+            hard_fp_threshold=args.hard_fp_threshold,
+            train_neg_pos_ratio=args.train_neg_pos_ratio,
+        )
+        val_dataset = build_split_dataset(args.dataset, 'val')
     train_dataset = limit_dataset(train_dataset, args.limit_train_samples)
     val_dataset = limit_dataset(val_dataset, args.limit_val_samples)
 
@@ -473,12 +494,19 @@ def main():
         if args.distributed else None
     val_sampler = DistributedSampler(val_dataset, num_replicas=args.world_size, rank=args.rank, shuffle=False) \
         if args.distributed else None
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=(train_sampler is None),
+    if args.sample_by_ct:
+        # Each dataset item already contains ``batch_size`` patches from one CT.
+        loader_batch_size = 1
+        collate_fn = ct_batch_collate
+    else:
+        loader_batch_size = batch_size
+        collate_fn = train_collate
+    train_loader = DataLoader(train_dataset, batch_size=loader_batch_size, shuffle=(train_sampler is None),
                               sampler=train_sampler,
-                              num_workers=args.num_workers, pin_memory=pin_memory, collate_fn=train_collate)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                              num_workers=args.num_workers, pin_memory=pin_memory, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=loader_batch_size, shuffle=False,
                             sampler=val_sampler,
-                            num_workers=args.num_workers, pin_memory=pin_memory, collate_fn=train_collate)
+                            num_workers=args.num_workers, pin_memory=pin_memory, collate_fn=collate_fn)
 
     # Initilize network
     net = getattr(this_module, net)(net_config, use_aspp=args.use_aspp)

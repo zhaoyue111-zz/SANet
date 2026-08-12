@@ -72,6 +72,8 @@ net_config = {
         'blur': True,
     },
     'r_rand_crop': 0.2,  # 随机背景 crop 比例，用于增加负样本覆盖
+    # --sample-by-ct: 每个 CT 预生成的随机背景负样本池大小；<=0 时用 max(16, 2*n_neg)
+    'ct_neg_pool_size': 0,
     'intensity_aug': {
         'contrast_range': [0.8, 1.2],
         'brightness_range': [-0.12, 0.12],
