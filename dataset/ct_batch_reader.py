@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""CT-centric train batch dataset: one __getitem__ loads one CT and returns a full batch.
+"""CT-centric train batch dataset for I/O speed experiments.
 
-Enabled via train.py --sample-by-ct (train only). Val/eval/test keep using BboxReader.
+One dataset item = one positive CT = one full batch, with a single np.load.
+Enabled via train.py --sample-by-ct (train only). Val/eval/test keep BboxReader.
 """
 
 from __future__ import annotations
 
-import math
 import os
 import random
 import time
@@ -14,7 +14,7 @@ import time
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import ConcatDataset, Dataset, Subset
+from torch.utils.data import ConcatDataset, Dataset
 
 from dataset.bbox_reader import (
     Crop,
@@ -34,11 +34,7 @@ def _clamp_neg_pos_ratio(ratio):
 
 
 def split_pos_neg_counts(batch_size, neg_pos_ratio):
-    """Return (n_pos, n_neg) with n_pos + n_neg == batch_size.
-
-    neg_pos_ratio follows existing config: num_neg ~= num_pos * ratio.
-    Odd batch sizes prefer more positives than negatives.
-    """
+    """Return (n_pos, n_neg) with n_pos + n_neg == batch_size."""
     batch_size = int(batch_size)
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
@@ -58,14 +54,7 @@ def split_pos_neg_counts(batch_size, neg_pos_ratio):
 
 
 def sample_pool_indices(pool_size, n):
-    """Sample ``n`` indices from a pool of size ``pool_size``.
-
-    * pool_size >= n: without replacement
-    * pool_size < n: every index once, then with-replacement extras
-      (extras marked force_simple_aug=True)
-
-    Returns list of (pool_index, force_simple_aug).
-    """
+    """Sample n indices: without replacement if enough; else all once + extras with simple-aug."""
     pool_size = int(pool_size)
     n = int(n)
     if pool_size <= 0 or n <= 0:
@@ -73,7 +62,6 @@ def sample_pool_indices(pool_size, n):
     if pool_size >= n:
         chosen = np.random.choice(pool_size, size=n, replace=False)
         return [(int(j), False) for j in chosen]
-
     order = np.random.permutation(pool_size)
     picks = [(int(j), False) for j in order]
     for _ in range(n - pool_size):
@@ -81,19 +69,8 @@ def sample_pool_indices(pool_size, n):
     return picks
 
 
-def set_ct_batch_epoch(dataset, epoch):
-    """Rebuild CT batch plans for CTBatchDataset (including Concat/Subset wrappers)."""
-    if isinstance(dataset, CTBatchDataset):
-        dataset.set_epoch(int(epoch))
-    elif isinstance(dataset, ConcatDataset):
-        for sub in dataset.datasets:
-            set_ct_batch_epoch(sub, epoch)
-    elif isinstance(dataset, Subset):
-        set_ct_batch_epoch(dataset.dataset, epoch)
-
-
 class CTBatchDataset(Dataset):
-    """Train-only: each index is one pre-planned single-CT batch."""
+    """Train-only: ``__len__`` = #positive CTs; each item loads one CT and returns a full batch."""
 
     def __init__(self, data_dir, set_name, cfg, mode='train', batch_size=8):
         if mode != 'train':
@@ -110,12 +87,7 @@ class CTBatchDataset(Dataset):
         self.pad_value = cfg['pad_value']
         self.partial_gt_positive_threshold = float(cfg.get('partial_gt_positive_threshold', 0.5))
         self.neg_pos_ratio = _clamp_neg_pos_ratio(cfg.get('train_neg_pos_ratio', 1.0))
-        self.neg_only_batch_ratio = float(cfg.get('ct_neg_only_batch_ratio', 0.1))
-        self.neg_only_batch_ratio = min(1.0, max(0.0, self.neg_only_batch_ratio))
         self.crop = Crop(cfg)
-        self.epoch = 0
-        self.batch_plan = []
-        self.last_plan_stats = {}
 
         with open(self.set_name, "r") as f:
             self.filenames = [line.strip() for line in f if line.strip()]
@@ -145,8 +117,7 @@ class CTBatchDataset(Dataset):
         if not self.filenames:
             raise ValueError("No available preprocessed images for %s" % self.set_name)
 
-        csv_dir = cfg['train_anno']
-        annos_all = pd.read_csv(csv_dir)
+        annos_all = pd.read_csv(cfg['train_anno'])
         filename_to_idx = {}
         for i, fn in enumerate(self.filenames):
             for key in _pid_keys(fn):
@@ -169,7 +140,7 @@ class CTBatchDataset(Dataset):
             labels.append(l)
         self.sample_bboxes = labels
 
-        # Positive patch sources: GT + hard FN (same as BboxReader).
+        # Positive sources: GT + hard FN (same as BboxReader).
         self.bboxes = []
         for i, l in enumerate(labels):
             if len(l) > 0:
@@ -184,7 +155,6 @@ class CTBatchDataset(Dataset):
                 % (self.dataset_name or 'dataset', self.set_name)
             )
         self.bboxes = np.concatenate(self.bboxes, axis=0).astype(np.float32)
-        self.num_positive_samples = len(self.bboxes)
 
         self.hard_fps_by_ct = {i: [] for i in range(len(self.filenames))}
         hard_fps = _load_hard_fps(
@@ -207,192 +177,21 @@ class CTBatchDataset(Dataset):
         if not self.pos_ct_indices:
             raise ValueError("No CT with positive samples for %s" % self.set_name)
 
-        # CTs with no positives: FP-only (has hard FP) or pure background.
-        self.fp_only_ct_indices = [
-            i for i in range(len(self.filenames))
-            if len(self.positives_by_ct[i]) == 0 and len(self.hard_fps_by_ct.get(i, [])) > 0
-        ]
-        self.pure_bg_ct_indices = [
-            i for i in range(len(self.filenames))
-            if len(self.positives_by_ct[i]) == 0 and len(self.hard_fps_by_ct.get(i, [])) == 0
-        ]
-        self.neg_only_ct_indices = self.fp_only_ct_indices + self.pure_bg_ct_indices
-
         self.n_pos, self.n_neg = split_pos_neg_counts(self.batch_size, self.neg_pos_ratio)
-        self.target_pos_batches = max(
-            1, int(math.ceil(float(self.num_positive_samples) / float(self.n_pos)))
-        )
-        self.set_epoch(0)
 
         print(
-            "[%s] CTBatchDataset train cts_pos=%d fp_only=%d pure_bg=%d positives=%d "
-            "target_pos_batches=%d neg_only_ratio=%.3f batch=%d (pos=%d,neg=%d) hard_fp=%d"
+            "[%s] CTBatchDataset positive_cts=%d batch_size=%d n_pos=%d n_neg=%d"
             % (
                 self.dataset_name or self.set_name,
                 len(self.pos_ct_indices),
-                len(self.fp_only_ct_indices),
-                len(self.pure_bg_ct_indices),
-                self.num_positive_samples,
-                self.target_pos_batches,
-                self.neg_only_batch_ratio,
                 self.batch_size,
                 self.n_pos,
                 self.n_neg,
-                sum(len(v) for v in self.hard_fps_by_ct.values()),
             )
         )
 
     def __len__(self):
-        return len(self.batch_plan)
-
-    def set_epoch(self, epoch):
-        """Rebuild and shuffle the CT-level batch plan for this epoch."""
-        self.epoch = int(epoch)
-        self.batch_plan = self._build_batch_plan(self.epoch)
-        self.last_plan_stats = self._compute_plan_stats(self.batch_plan)
-        self._print_plan_stats(self.last_plan_stats)
-
-    def _cyclic_take(self, items, count, epoch, rng):
-        """Epoch-dependent shuffle + cyclic window; avoids always taking the head."""
-        if not items or count <= 0:
-            return []
-        order = list(items)
-        rng.shuffle(order)
-        n = len(order)
-        offset = (int(epoch) * int(count)) % n
-        return [order[(offset + i) % n] for i in range(int(count))]
-
-    def _make_pos_batch_candidates(self, rng):
-        """All CT-level positive batches for this epoch's per-CT GT shuffle."""
-        candidates = []
-        # Shuffle CT order so candidate list is not always CT0-first.
-        ct_order = list(self.pos_ct_indices)
-        rng.shuffle(ct_order)
-        for ct_idx in ct_order:
-            n_src = len(self.positives_by_ct[ct_idx])
-            order = np.arange(n_src)
-            rng.shuffle(order)
-            for start in range(0, n_src, self.n_pos):
-                chunk = order[start:start + self.n_pos]
-                picks = [(int(j), False) for j in chunk]
-                while len(picks) < self.n_pos:
-                    picks.append((int(rng.randint(0, n_src)), True))
-                candidates.append({
-                    'kind': 'pos',
-                    'ct_idx': int(ct_idx),
-                    'pos_picks': picks,
-                })
-        return candidates
-
-    def _make_neg_only_batch(self, ct_idx, rng):
-        hard = self.hard_fps_by_ct.get(ct_idx, [])
-        if hard:
-            order = np.arange(len(hard))
-            rng.shuffle(order)
-            # One batch only: take up to batch_size hard FPs, pad with hard/random.
-            take = min(self.batch_size, len(order))
-            neg_picks = [('hard', int(order[i]), False) for i in range(take)]
-            while len(neg_picks) < self.batch_size:
-                if hard:
-                    neg_picks.append(('hard', int(rng.randint(0, len(hard))), True))
-                else:
-                    neg_picks.append(('rand', None, True))
-        else:
-            neg_picks = [('rand', None, False) for _ in range(self.batch_size)]
-        return {
-            'kind': 'neg_only',
-            'ct_idx': int(ct_idx),
-            'neg_picks': neg_picks,
-        }
-
-    def _build_batch_plan(self, epoch):
-        rng = np.random.RandomState(int(epoch) * 1000003 + 17)
-        plan = []
-
-        # Positive budget ≈ original BboxReader positive exposure.
-        target = self.target_pos_batches
-        candidates = self._make_pos_batch_candidates(rng)
-        n_cand = len(candidates)
-        if n_cand == 0:
-            raise RuntimeError("No positive CT batch candidates")
-        # Cyclic window over shuffled candidates: rotates across epochs.
-        offset = (int(epoch) * int(target)) % n_cand
-        pos_plan = [candidates[(offset + i) % n_cand] for i in range(target)]
-        plan.extend(pos_plan)
-
-        # Few negative-only batches; FP-only preferred over pure background.
-        if self.neg_only_batch_ratio > 0 and self.neg_only_ct_indices:
-            n_neg_only = int(math.ceil(float(target) * self.neg_only_batch_ratio - 1e-12))
-        else:
-            n_neg_only = 0
-        if n_neg_only > 0:
-            n_fp = min(len(self.fp_only_ct_indices), n_neg_only)
-            n_bg = min(len(self.pure_bg_ct_indices), max(0, n_neg_only - n_fp))
-            # Separate rng streams so fp/bg shuffles do not consume the same draws unevenly.
-            fp_rng = np.random.RandomState(int(epoch) * 1000003 + 101)
-            bg_rng = np.random.RandomState(int(epoch) * 1000003 + 202)
-            selected_cts = (
-                self._cyclic_take(self.fp_only_ct_indices, n_fp, epoch, fp_rng)
-                + self._cyclic_take(self.pure_bg_ct_indices, n_bg, epoch, bg_rng)
-            )
-            for ct_idx in selected_cts:
-                plan.append(self._make_neg_only_batch(ct_idx, rng))
-
-        rng.shuffle(plan)
-        return plan
-
-    def _compute_plan_stats(self, plan):
-        pos_batches = 0
-        neg_only_batches = 0
-        unique_positive_cts = set()
-        positive_slots = 0
-        repeated_positive_slots = 0
-        negative_slots = 0
-
-        for entry in plan:
-            if entry['kind'] == 'pos':
-                pos_batches += 1
-                unique_positive_cts.add(int(entry['ct_idx']))
-                for _pool_i, force_simple in entry['pos_picks']:
-                    positive_slots += 1
-                    if force_simple:
-                        repeated_positive_slots += 1
-                negative_slots += self.n_neg
-            else:
-                neg_only_batches += 1
-                negative_slots += len(entry['neg_picks'])
-
-        ratio = float(negative_slots) / float(max(1, positive_slots))
-        return {
-            'epoch': int(self.epoch),
-            'pos_batches': pos_batches,
-            'neg_only_batches': neg_only_batches,
-            'unique_positive_cts': len(unique_positive_cts),
-            'positive_slots': positive_slots,
-            'repeated_positive_slots': repeated_positive_slots,
-            'negative_slots': negative_slots,
-            'estimated_neg_pos_ratio': ratio,
-            'total_batches': len(plan),
-        }
-
-    def _print_plan_stats(self, stats):
-        print(
-            "[%s] CTBatch plan epoch=%d | pos_batches=%d neg_only_batches=%d "
-            "unique_positive_cts=%d positive_slots=%d repeated_positive_slots=%d "
-            "negative_slots=%d estimated_neg/pos=%.3f total_batches=%d"
-            % (
-                self.dataset_name or self.set_name,
-                stats['epoch'],
-                stats['pos_batches'],
-                stats['neg_only_batches'],
-                stats['unique_positive_cts'],
-                stats['positive_slots'],
-                stats['repeated_positive_slots'],
-                stats['negative_slots'],
-                stats['estimated_neg_pos_ratio'],
-                stats['total_batches'],
-            )
-        )
+        return len(self.pos_ct_indices)
 
     def load_image(self, filename):
         path = os.path.join(self.data_dir, '%s_zoom.npy' % filename)
@@ -410,7 +209,6 @@ class CTBatchDataset(Dataset):
         ) from last_exc
 
     def _enabled_simple_augs(self):
-        """Simple-aug choices that are enabled in augtype (closed ones never run)."""
         choices = []
         if self.augtype.get('flip', False):
             choices.append('flip')
@@ -515,62 +313,31 @@ class CTBatchDataset(Dataset):
         sample, target, bboxes = self._apply_full_aug(sample, target, bboxes, is_random_crop)
         return self._finalize_sample(sample, bboxes)
 
-    def _plan_negatives_same_ct(self, ct_idx):
-        """Hard-FP-first negatives from the current CT only; fill with same-CT random crops."""
-        n_neg = self.n_neg
-        if n_neg <= 0:
-            return []
-
-        reserve_rand = 1 if n_neg >= 2 else 0
-        hard_budget = n_neg - reserve_rand
-        hard = self.hard_fps_by_ct.get(ct_idx, [])
-        specs = []  # ('hard', center, force_simple) | ('rand', None, False)
-
-        take = min(hard_budget, len(hard))
-        for pool_i, force_simple in sample_pool_indices(len(hard), take):
-            specs.append(('hard', hard[pool_i], force_simple))
-
-        while len(specs) < n_neg:
-            specs.append(('rand', None, False))
-        return specs
-
     def __getitem__(self, index):
-        index = int(index)
-        entry = self.batch_plan[index]
-        ct_idx = int(entry['ct_idx'])
-
-        # Patch-level randomness; CT + positive indices come from the plan.
-        rng_seed = (
-            (self.epoch + 1) * 1000003
-            ^ (index + 1) * 9176
-            ^ (os.getpid() * 13)
-        )
-        np.random.seed(rng_seed % (2 ** 32 - 1))
-        random.seed(rng_seed % (2 ** 32 - 1))
-
-        # One CT load for the whole batch.
+        ct_idx = int(self.pos_ct_indices[int(index)])
         imgs = self.load_image(self.filenames[ct_idx])
-        samples = []
 
-        if entry['kind'] == 'pos':
-            pos_pool = self.positives_by_ct[ct_idx]
-            for pool_i, force_simple in entry['pos_picks']:
-                crop = self._crop_positive(imgs, ct_idx, pos_pool[pool_i])
-                samples.append(self._assemble_from_crop(*crop, force_simple_aug=force_simple))
-            for kind, center, force_simple in self._plan_negatives_same_ct(ct_idx):
-                if kind == 'hard':
+        pos_pool = self.positives_by_ct[ct_idx]
+        hard_fps = self.hard_fps_by_ct.get(ct_idx, [])
+
+        samples = []
+        for pool_i, force_simple in sample_pool_indices(len(pos_pool), self.n_pos):
+            crop = self._crop_positive(imgs, ct_idx, pos_pool[pool_i])
+            samples.append(self._assemble_from_crop(*crop, force_simple_aug=force_simple))
+
+        # Negatives: current-CT hard FP first, then same-CT random background.
+        if self.n_neg > 0:
+            if len(hard_fps) >= self.n_neg:
+                for pool_i, _force in sample_pool_indices(len(hard_fps), self.n_neg):
+                    crop = self._crop_hard_fp(imgs, ct_idx, hard_fps[pool_i])
+                    samples.append(self._assemble_from_crop(*crop, force_simple_aug=False))
+            else:
+                for center in hard_fps:
                     crop = self._crop_hard_fp(imgs, ct_idx, center)
-                else:
+                    samples.append(self._assemble_from_crop(*crop, force_simple_aug=False))
+                for _ in range(self.n_neg - len(hard_fps)):
                     crop = self._crop_random_bg(imgs, ct_idx)
-                samples.append(self._assemble_from_crop(*crop, force_simple_aug=force_simple))
-        else:
-            hard = self.hard_fps_by_ct.get(ct_idx, [])
-            for kind, hard_i, force_simple in entry['neg_picks']:
-                if kind == 'hard':
-                    crop = self._crop_hard_fp(imgs, ct_idx, hard[hard_i])
-                else:
-                    crop = self._crop_random_bg(imgs, ct_idx)
-                samples.append(self._assemble_from_crop(*crop, force_simple_aug=force_simple))
+                    samples.append(self._assemble_from_crop(*crop, force_simple_aug=False))
 
         random.shuffle(samples)
         return samples

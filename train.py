@@ -20,7 +20,7 @@ from net.sanet import SANet
 import time
 from dataset.collate import train_collate, test_collate, eval_collate, ct_batch_collate
 from dataset.bbox_reader import BboxReader
-from dataset.ct_batch_reader import build_ct_batch_datasets, set_ct_batch_epoch
+from dataset.ct_batch_reader import build_ct_batch_datasets
 from utils.util import Logger
 from config import (
     train_config, data_config, net_config, config,
@@ -269,8 +269,8 @@ parser.add_argument('--hard-fp-threshold', default=0.9, type=float,
 parser.add_argument('--train-neg-pos-ratio', default=net_config.get('train_neg_pos_ratio', 1.0), type=float,
                     help='Negative/positive sample ratio per training epoch. Clamped to [1/3, 1].')
 parser.add_argument('--sample-by-ct', action='store_true',
-                    help='Train only: one DataLoader item = full batch from one main CT '
-                         '(load primary volume once). Val/eval/test keep BboxReader.')
+                    help='Train only: each positive CT is one item; load once and crop a full batch. '
+                         'Val/eval/test keep BboxReader.')
 parser.add_argument('--local-rank', '--local_rank', default=-1, type=int,
                     help='local rank passed by torchrun/torch.distributed.launch')
 parser.add_argument('--dist-backend', default='nccl', type=str,
@@ -609,9 +609,6 @@ def main():
     for i in tqdm(range(start_epoch, epochs + 1), desc='Total', disable=not is_main_process(args)):
         if train_sampler is not None:
             train_sampler.set_epoch(i)
-        if args.sample_by_ct:
-            # Rebuild/shuffle CT batch_plan before DataLoader workers pickle the dataset.
-            set_ct_batch_epoch(train_dataset, i)
         # learning rate schedule
         if isinstance(optimizer, torch.optim.SGD):
             base_lr = lr_schdule(i, init_lr=init_lr, total=epochs)
