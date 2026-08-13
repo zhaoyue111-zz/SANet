@@ -1,5 +1,7 @@
 import os
 import sys
+import json
+from datetime import datetime, timezone
 
 os.environ.setdefault('MPLCONFIGDIR', '/tmp/matplotlib')
 
@@ -276,6 +278,8 @@ parser.add_argument('--local-rank', '--local_rank', default=-1, type=int,
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend for DDP training')
 parser.add_argument('--use-aspp', action='store_true', help='Enable ASPP3D in the RPN head.')
+parser.add_argument('--training-log', default=None, type=str,
+                    help='JSONL training log path. Default: <out-dir>/training.log')
 
 
 class NullWriter:
@@ -322,6 +326,69 @@ def is_main_process(args):
 
 def unwrap_model(net):
     return net.module if isinstance(net, DistributedDataParallel) else net
+
+
+def format_data_source(paths):
+    if paths is None:
+        return ''
+    if isinstance(paths, (list, tuple)):
+        return ','.join(str(p) for p in paths)
+    return str(paths)
+
+
+def get_optimizer_lr(optimizer):
+    """Return the primary (non-rcnn) learning rate currently used by the optimizer."""
+    for group in optimizer.param_groups:
+        if group.get('name') != 'rcnn':
+            return float(group['lr'])
+    return float(optimizer.param_groups[0]['lr'])
+
+
+def compute_train_log_indices(num_batches, max_logs=10):
+    """Up to ``max_logs`` step indices per epoch; always includes 0 when possible."""
+    num_batches = int(num_batches)
+    if num_batches <= 0:
+        return set()
+    interval = max(1, num_batches // max_logs)
+    indices = list(range(0, num_batches, interval))[:max_logs]
+    if 0 not in indices:
+        indices = [0] + [i for i in indices if i != 0]
+        indices = indices[:max_logs]
+    return set(indices)
+
+
+class JsonTrainingLogger(object):
+    """Append-only JSONL logger for structured training records."""
+
+    def __init__(self, path, enabled=True):
+        self.path = path
+        self.enabled = bool(enabled) and bool(path)
+        if self.enabled:
+            parent = os.path.dirname(os.path.abspath(self.path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+
+    def log(self, epoch, step, phase, mode, data_source, loss=None, lr=None,
+            checkpoint=None, pretrained_from=None):
+        if not self.enabled:
+            return
+        record = {
+            'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z',
+            'epoch': int(epoch),
+            'step': int(step),
+            'phase': phase,
+            'mode': mode,
+            'data_source': data_source,
+        }
+        if loss is not None:
+            record['loss'] = float(loss)
+        if lr is not None:
+            record['lr'] = float(lr)
+        record['checkpoint'] = checkpoint
+        if pretrained_from is not None:
+            record['pretrained_from'] = pretrained_from
+        with open(self.path, 'a') as f:
+            f.write(json.dumps(record, ensure_ascii=False) + '\n')
 
 
 def strip_module_prefix(state_dict):
@@ -597,6 +664,25 @@ def main():
     print('[start_epoch %d, out_dir %s]' % (start_epoch, out_dir))
     print('[length of train loader %d, length of valid loader %d]' % (len(train_loader), len(val_loader)))
 
+    training_log_path = args.training_log or os.path.join(out_dir, 'training.log')
+    json_logger = JsonTrainingLogger(training_log_path, enabled=is_main_process(args))
+    train_data_source = format_data_source(args.train_set)
+    val_data_source = format_data_source(args.val_set)
+    step_state = {'step': max(0, (start_epoch - 1) * len(train_loader))}
+    if is_main_process(args):
+        print('[training json log: %s]' % training_log_path)
+        if initial_checkpoint:
+            json_logger.log(
+                epoch=max(start_epoch - 1, 0),
+                step=step_state['step'],
+                phase='train',
+                mode='training',
+                data_source=train_data_source,
+                lr=get_optimizer_lr(optimizer),
+                checkpoint=None,
+                pretrained_from=initial_checkpoint,
+            )
+
     # Write graph to tensorboard for visualization
     if is_main_process(args):
         writer = SummaryWriter(tb_out_dir)
@@ -652,8 +738,11 @@ def main():
         print('[loss weights: rpn_cls %.2f, rpn_reg %.2f, rcnn_cls %.2f, rcnn_reg %.2f]' % model.loss_weights)
 
         print('[epoch %d, base_lr %.6f, rcnn_lr %.6f, use_rcnn: %r]' % (i, base_lr, rcnn_lr, model.use_rcnn))
-        train(net, train_loader, optimizer, i, train_writer, args)
-        val_summary = validate(net, val_loader, i, val_writer, args)
+        train(net, train_loader, optimizer, i, train_writer, args,
+              json_logger=json_logger, step_state=step_state, data_source=train_data_source)
+        val_summary = validate(net, val_loader, i, val_writer, args,
+                               json_logger=json_logger, step_state=step_state,
+                               data_source=val_data_source, optimizer=optimizer)
         val_loss = distributed_mean(val_summary['loss'], args)
         val_froc_mean = distributed_mean(val_summary['froc_mean'], args)
 
@@ -705,9 +794,31 @@ def main():
         # if i % epoch_save == 0:
         #     torch.save(checkpoint, os.path.join(model_out_dir, '%03d.ckpt' % i))
 
-        torch.save(checkpoint, os.path.join(model_out_dir, 'final.ckpt'))
+        final_ckpt_path = os.path.join(model_out_dir, 'final.ckpt')
+        torch.save(checkpoint, final_ckpt_path)
+        json_logger.log(
+            epoch=i,
+            step=step_state['step'],
+            phase='val',
+            mode='training',
+            data_source=val_data_source,
+            loss=val_loss,
+            lr=get_optimizer_lr(optimizer),
+            checkpoint=final_ckpt_path,
+        )
         if is_best:
-            torch.save(checkpoint, os.path.join(model_out_dir, 'best.ckpt'))
+            best_ckpt_path = os.path.join(model_out_dir, 'best.ckpt')
+            torch.save(checkpoint, best_ckpt_path)
+            json_logger.log(
+                epoch=i,
+                step=step_state['step'],
+                phase='val',
+                mode='training',
+                data_source=val_data_source,
+                loss=val_loss,
+                lr=get_optimizer_lr(optimizer),
+                checkpoint=best_ckpt_path,
+            )
             print('[best checkpoint updated: epoch %d, val_froc_mean %.6f, val_loss %.6f]' % (
                 i, val_froc_mean, val_loss))
         if is_best_rcnn:
@@ -732,7 +843,8 @@ def main():
     cleanup_distributed(args)
 
 
-def train(net, train_loader, optimizer, epoch, writer, args):
+def train(net, train_loader, optimizer, epoch, writer, args,
+          json_logger=None, step_state=None, data_source=None):
     model = unwrap_model(net)
     model.set_mode('train')
     s = time.time()
@@ -741,6 +853,9 @@ def train(net, train_loader, optimizer, epoch, writer, args):
     total_loss = []
     rpn_stats = []
     rcnn_stats = []
+    if step_state is None:
+        step_state = {'step': 0}
+    log_indices = compute_train_log_indices(len(train_loader))
 
     for j, (input, truth_box, truth_label) in tqdm(enumerate(train_loader), total=len(train_loader),
                                                    desc='Train %d' % epoch, disable=not is_main_process(args)):
@@ -758,9 +873,23 @@ def train(net, train_loader, optimizer, epoch, writer, args):
         rcnn_cls_loss.append(model.rcnn_cls_loss.cpu().data.item())
         rcnn_reg_loss.append(model.rcnn_reg_loss.cpu().data.item())
 
-        total_loss.append(loss.cpu().data.item())
+        step_loss = loss.cpu().data.item()
+        total_loss.append(step_loss)
         rpn_stats.append(to_numpy_safe(rpn_stat))
         rcnn_stats.append(to_numpy_safe(rcnn_stat))
+
+        if json_logger is not None and j in log_indices:
+            json_logger.log(
+                epoch=epoch,
+                step=step_state['step'],
+                phase='train',
+                mode='training',
+                data_source=data_source or '',
+                loss=step_loss,
+                lr=get_optimizer_lr(optimizer),
+                checkpoint=None,
+            )
+        step_state['step'] += 1
 
         del input, truth_box, truth_label, loss, rpn_stat, rcnn_stat
         clear_model_batch_state(model)
@@ -822,7 +951,8 @@ def train(net, train_loader, optimizer, epoch, writer, args):
 
     torch.cuda.empty_cache()
 
-def validate(net, val_loader, epoch, writer, args):
+def validate(net, val_loader, epoch, writer, args,
+             json_logger=None, step_state=None, data_source=None, optimizer=None):
     model = unwrap_model(net)
     model.set_mode('valid')
     rpn_cls_loss, rpn_reg_loss = [], []
@@ -931,6 +1061,17 @@ def validate(net, val_loader, epoch, writer, args):
 
     # Write to tensorboard
     val_loss = np.average(total_loss)
+    if json_logger is not None:
+        json_logger.log(
+            epoch=epoch,
+            step=(step_state or {}).get('step', 0),
+            phase='val',
+            mode='training',
+            data_source=data_source or '',
+            loss=float(val_loss),
+            lr=get_optimizer_lr(optimizer) if optimizer is not None else None,
+            checkpoint=None,
+        )
     writer.add_scalar('loss', val_loss, epoch)
     writer.add_scalar('rpn_cls', np.average(rpn_cls_loss), epoch)
     writer.add_scalar('rpn_reg', np.average(rpn_reg_loss), epoch)
