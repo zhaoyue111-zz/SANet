@@ -27,6 +27,13 @@ BBOX_COLUMNS = (
     "bbox_min_z", "bbox_min_y", "bbox_min_x",
     "bbox_max_z", "bbox_max_y", "bbox_max_x",
 )
+SOURCE_REQUIRED_COLUMNS = (
+    "patient_id", "studyInstanceUID", "seriesInstanceUID", "lesion_id",
+) + BBOX_COLUMNS
+TARGET_COLUMNS = [
+    "pid", "patient_id", "studyInstanceUID", "seriesInstanceUID",
+    "lesion_id", "nodule_id", *BBOX_COLUMNS,
+]
 
 
 def scalar_string(value) -> str:
@@ -42,11 +49,26 @@ def read_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
         return list(reader.fieldnames), list(reader)
 
 
+def project_source_rows(fields: list[str], rows: list[dict[str, str]]):
+    """Extract only source identity, lesion, and bbox fields."""
+    missing = [column for column in SOURCE_REQUIRED_COLUMNS if column not in fields]
+    if missing:
+        raise ValueError("Source annotation missing required columns: %s" % missing)
+
+    projected = []
+    for row in rows:
+        projected_row = {}
+        for column in SOURCE_REQUIRED_COLUMNS:
+            projected_row[column] = row[column]
+        projected.append(projected_row)
+    return projected
+
+
 def bbox_from_row(row: dict[str, str]) -> tuple[np.ndarray, np.ndarray]:
     minimum = np.array([int(row[f"bbox_min_{axis}"]) for axis in "zyx"], dtype=int)
     maximum = np.array([int(row[f"bbox_max_{axis}"]) for axis in "zyx"], dtype=int)
     if np.any(minimum > maximum):
-        raise ValueError(f"Invalid bbox corners for pid={row.get('pid')}: {row}")
+        raise ValueError(f"Invalid bbox corners for series={row.get('seriesInstanceUID')}: {row}")
     return minimum, maximum
 
 
@@ -60,16 +82,9 @@ def assert_bbox_in_shape(minimum: np.ndarray, maximum: np.ndarray,
         )
 
 
-def convert_annotations(source_rows: list[dict[str, str]],
-                        organized_rows: list[dict[str, str]],
-                        npz_dir: Path) -> tuple[list[dict[str, str]], dict[str, int]]:
-    source_by_pid = {row["pid"]: row for row in source_rows}
-    if len(source_by_pid) != len(source_rows):
-        raise ValueError("Source annotation pid values must be unique and row-level")
-    if set(source_by_pid) != {str(i) for i in range(len(source_rows))}:
-        raise ValueError("Source annotation pid values must be the linear range 0..N-1")
-
+def convert_annotations(source_rows: list[dict[str, str]], npz_dir: Path):
     converted_rows = []
+    nodule_counts = {}
     stats = {
         "source_rows": len(source_rows),
         "full_shape_ok": 0,
@@ -77,14 +92,11 @@ def convert_annotations(source_rows: list[dict[str, str]],
         "cropped_shape_ok": 0,
     }
 
-    for organized_row in organized_rows:
-        pid = organized_row["pid"]
-        if pid not in source_by_pid:
-            raise ValueError(f"Organized annotation pid={pid} is missing from source CSV")
-        source_row = source_by_pid[pid]
-        if organized_row.get("seriesInstanceUID") != source_row.get("seriesInstanceUID"):
-            raise ValueError(f"Series mismatch for pid={pid}")
-
+    for pid, source_row in enumerate(source_rows):
+        pid = str(pid)
+        patient_id = str(source_row["patient_id"])
+        nodule_id = nodule_counts.get(patient_id, 0)
+        nodule_counts[patient_id] = nodule_id + 1
         series_uid = source_row["seriesInstanceUID"]
         npz_path = npz_dir / f"{series_uid}.npz"
         if not npz_path.is_file():
@@ -127,7 +139,14 @@ def convert_annotations(source_rows: list[dict[str, str]],
         )
         stats["cropped_shape_ok"] += 1
 
-        output_row = dict(organized_row)
+        output_row = {
+            "pid": pid,
+            "patient_id": patient_id,
+            "studyInstanceUID": str(source_row["studyInstanceUID"]),
+            "seriesInstanceUID": series_uid,
+            "lesion_id": str(source_row["lesion_id"]),
+            "nodule_id": str(nodule_id),
+        }
         for axis_index, axis in enumerate("zyx"):
             output_row[f"bbox_min_{axis}"] = str(int(cropped_minimum[axis_index]))
             output_row[f"bbox_max_{axis}"] = str(int(cropped_maximum[axis_index]))
@@ -146,13 +165,10 @@ def main() -> None:
     args = parser.parse_args()
 
     source_fields, source_rows = read_csv(args.source_csv)
-    organized_fields, organized_rows = read_csv(args.organized_csv)
-    missing_source = [column for column in BBOX_COLUMNS if column not in source_fields]
-    missing_organized = [column for column in BBOX_COLUMNS if column not in organized_fields]
-    if missing_source or missing_organized:
-        raise ValueError(f"Missing bbox columns: source={missing_source}, organized={missing_organized}")
-
-    converted_rows, stats = convert_annotations(source_rows, organized_rows, args.npz_dir)
+    if not source_rows:
+        raise ValueError("Source annotation has no data rows: %s" % args.source_csv)
+    source_rows = project_source_rows(source_fields, source_rows)
+    converted_rows, stats = convert_annotations(source_rows, args.npz_dir)
 
     print("Source annotation coordinate check:")
     print(f"  rows: {stats['source_rows']}")
@@ -166,7 +182,7 @@ def main() -> None:
         return
 
     with args.organized_csv.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=organized_fields)
+        writer = csv.DictWriter(handle, fieldnames=TARGET_COLUMNS)
         writer.writeheader()
         writer.writerows(converted_rows)
     print(f"Wrote converted annotation: {args.organized_csv}")
