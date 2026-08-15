@@ -23,6 +23,7 @@ import time
 from dataset.collate import train_collate, test_collate, eval_collate, ct_batch_collate
 from dataset.bbox_reader import BboxReader
 from dataset.ct_batch_reader import build_ct_batch_datasets
+from dataset.organized_npz_reader import build_organized_npz_datasets
 from utils.util import Logger
 from config import (
     train_config, data_config, net_config, config,
@@ -273,6 +274,22 @@ parser.add_argument('--train-neg-pos-ratio', default=net_config.get('train_neg_p
 parser.add_argument('--sample-by-ct', action='store_true',
                     help='Train only: each positive CT is one item; load once and crop a full batch. '
                          'Val/eval/test keep BboxReader.')
+parser.add_argument('--organized-npz', action='store_true',
+                    help='Use luna25_organized cropped-original-resolution NPZs with CT-level loading.')
+parser.add_argument('--data-root', default=None, type=str,
+                    help='Organized data root, e.g. /data/医保大赛/code/SANet/luna25_organized')
+parser.add_argument('--annotation', '--annotation-csv', dest='annotation', default=None, type=str,
+                    help='Organized annotation.csv path')
+parser.add_argument('--train-list', '--train-txt', dest='train_list', default=None, type=str,
+                    help='Organized train.txt path')
+parser.add_argument('--val-list', '--val-txt', dest='val_list', default=None, type=str,
+                    help='Organized val.txt path')
+parser.add_argument('--target-spacing-zyx', default='1.0,0.6,0.6', type=str,
+                    help='Online resampling spacing in array ZYX order; default 1.0,0.6,0.6')
+parser.add_argument('--window-min', default=-1200.0, type=float,
+                    help='HU window lower bound for organized NPZ input')
+parser.add_argument('--window-max', default=600.0, type=float,
+                    help='HU window upper bound for organized NPZ input')
 parser.add_argument('--local-rank', '--local_rank', default=-1, type=int,
                     help='local rank passed by torchrun/torch.distributed.launch')
 parser.add_argument('--dist-backend', default='nccl', type=str,
@@ -502,6 +519,38 @@ def limit_dataset(dataset, limit):
 def main():
     # Load training configuration
     args = parser.parse_args()
+    organized_requested = bool(
+        args.organized_npz
+        or args.data_root is not None
+        or args.annotation is not None
+        or args.train_list is not None
+        or args.val_list is not None
+    )
+    if organized_requested:
+        organized_missing = [
+            name for name, value in {
+                'data-root': args.data_root,
+                'annotation': args.annotation,
+                'train-list': args.train_list,
+                'val-list': args.val_list,
+            }.items() if not value
+        ]
+        if organized_missing:
+            raise ValueError(
+                'Organized NPZ mode requires --data-root, --annotation, --train-list, '
+                '--val-list; missing: %s' % ', '.join(organized_missing)
+            )
+        try:
+            target_spacing_zyx = tuple(
+                float(value.strip()) for value in args.target_spacing_zyx.split(',')
+            )
+        except ValueError as exc:
+            raise ValueError('--target-spacing-zyx must be comma-separated floats') from exc
+        if len(target_spacing_zyx) != 3:
+            raise ValueError('--target-spacing-zyx must contain exactly three values')
+        # Keep logging and downstream metadata aligned with the active split files.
+        args.train_set = [args.train_list]
+        args.val_set = [args.val_list]
     init_distributed_mode(args)
     if args.gpu and not args.distributed:
         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -527,7 +576,19 @@ def main():
     epoch_rcnn = args.epoch_rcnn
     batch_size = args.batch_size
     lr_schdule = train_config['lr_schedule']
-    if args.sample_by_ct:
+    if organized_requested:
+        train_dataset, val_dataset = build_organized_npz_datasets(
+            data_root=args.data_root,
+            annotation_csv=args.annotation,
+            train_list=args.train_list,
+            val_list=args.val_list,
+            cfg=dict(config, dataset='luna25_organized'),
+            batch_size=batch_size,
+            target_spacing_zyx=target_spacing_zyx,
+            window_min=args.window_min,
+            window_max=args.window_max,
+        )
+    elif args.sample_by_ct:
         train_dataset = build_ct_batch_datasets(
             args.dataset,
             batch_size=batch_size,
@@ -556,7 +617,20 @@ def main():
         if args.distributed else None
     val_sampler = DistributedSampler(val_dataset, num_replicas=args.world_size, rank=args.rank, shuffle=False) \
         if args.distributed else None
-    if args.sample_by_ct:
+    if organized_requested:
+        # Both splits are CT-level datasets. Each item loads one CT once and
+        # returns all lesion patches through ct_batch_collate.
+        train_loader = DataLoader(
+            train_dataset, batch_size=1, shuffle=(train_sampler is None),
+            sampler=train_sampler, num_workers=args.num_workers,
+            pin_memory=pin_memory, collate_fn=ct_batch_collate,
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=1, shuffle=False, sampler=val_sampler,
+            num_workers=args.num_workers, pin_memory=pin_memory,
+            collate_fn=ct_batch_collate,
+        )
+    elif args.sample_by_ct:
         # Each train item already contains ``batch_size`` patches from one main CT.
         train_loader = DataLoader(train_dataset, batch_size=1, shuffle=(train_sampler is None),
                                   sampler=train_sampler,
@@ -668,20 +742,12 @@ def main():
     json_logger = JsonTrainingLogger(training_log_path, enabled=is_main_process(args))
     train_data_source = format_data_source(args.train_set)
     val_data_source = format_data_source(args.val_set)
-    step_state = {'step': max(0, (start_epoch - 1) * len(train_loader))}
+    step_state = {
+        'step': max(0, (start_epoch - 1) * len(train_loader)),
+        'pretrained_from': initial_checkpoint if initial_checkpoint else None,
+    }
     if is_main_process(args):
         print('[training json log: %s]' % training_log_path)
-        if initial_checkpoint:
-            json_logger.log(
-                epoch=max(start_epoch - 1, 0),
-                step=step_state['step'],
-                phase='train',
-                mode='training',
-                data_source=train_data_source,
-                lr=get_optimizer_lr(optimizer),
-                checkpoint=None,
-                pretrained_from=initial_checkpoint,
-            )
 
     # Write graph to tensorboard for visualization
     if is_main_process(args):
@@ -800,7 +866,7 @@ def main():
             epoch=i,
             step=step_state['step'],
             phase='val',
-            mode='training',
+            mode='inference',
             data_source=val_data_source,
             loss=val_loss,
             lr=get_optimizer_lr(optimizer),
@@ -813,7 +879,7 @@ def main():
                 epoch=i,
                 step=step_state['step'],
                 phase='val',
-                mode='training',
+                mode='inference',
                 data_source=val_data_source,
                 loss=val_loss,
                 lr=get_optimizer_lr(optimizer),
@@ -879,6 +945,10 @@ def train(net, train_loader, optimizer, epoch, writer, args,
         rcnn_stats.append(to_numpy_safe(rcnn_stat))
 
         if json_logger is not None and j in log_indices:
+            pretrained_from = None
+            if step_state.get('pretrained_from'):
+                pretrained_from = step_state['pretrained_from']
+                step_state['pretrained_from'] = None
             json_logger.log(
                 epoch=epoch,
                 step=step_state['step'],
@@ -888,6 +958,7 @@ def train(net, train_loader, optimizer, epoch, writer, args,
                 loss=step_loss,
                 lr=get_optimizer_lr(optimizer),
                 checkpoint=None,
+                pretrained_from=pretrained_from,
             )
         step_state['step'] += 1
 
@@ -1061,17 +1132,6 @@ def validate(net, val_loader, epoch, writer, args,
 
     # Write to tensorboard
     val_loss = np.average(total_loss)
-    if json_logger is not None:
-        json_logger.log(
-            epoch=epoch,
-            step=(step_state or {}).get('step', 0),
-            phase='val',
-            mode='training',
-            data_source=data_source or '',
-            loss=float(val_loss),
-            lr=get_optimizer_lr(optimizer) if optimizer is not None else None,
-            checkpoint=None,
-        )
     writer.add_scalar('loss', val_loss, epoch)
     writer.add_scalar('rpn_cls', np.average(rpn_cls_loss), epoch)
     writer.add_scalar('rpn_reg', np.average(rpn_reg_loss), epoch)
@@ -1141,11 +1201,11 @@ if __name__ == '__main__':
 
 '''
 直接训练：
-    python train.py --dataset histopathology --epochs 10 --out-dir output
+    python train_new.py --dataset histopathology --epochs 10 --out-dir output
 
 恢复训练：
 默认从输出目录的 model/final.ckpt 恢复：
-  python train.py --dataset histopathology --resume --out-dir train_output
+  python train_new.py --dataset histopathology --resume --out-dir train_output
 指定某个 checkpoint 恢复：
-  python train.py --dataset histopathology --resume --ckpt train_output/model/final.ckpt
+  python train_new.py --dataset histopathology --resume --ckpt train_output/model/final.ckpt
 '''

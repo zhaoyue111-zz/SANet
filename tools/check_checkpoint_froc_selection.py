@@ -10,7 +10,7 @@ sys.path.insert(0, ROOT_DIR)
 
 
 def load_checkpoint_update_flags():
-    train_path = os.path.join(ROOT_DIR, "train.py")
+    train_path = os.path.join(ROOT_DIR, "train_local.py")
     with open(train_path, "r", encoding="utf-8") as f:
         tree = ast.parse(f.read(), filename=train_path)
     for node in tree.body:
@@ -20,14 +20,14 @@ def load_checkpoint_update_flags():
             namespace = {}
             exec(compile(module, train_path, "exec"), namespace)
             return namespace["checkpoint_update_flags"]
-    raise AssertionError("checkpoint_update_flags not found in train.py")
+    raise AssertionError("checkpoint_update_flags not found in train_local.py")
 
 
 checkpoint_update_flags = load_checkpoint_update_flags()
 
 
 def load_early_stop_improved():
-    train_path = os.path.join(ROOT_DIR, "train.py")
+    train_path = os.path.join(ROOT_DIR, "train_local.py")
     with open(train_path, "r", encoding="utf-8") as f:
         tree = ast.parse(f.read(), filename=train_path)
     for node in tree.body:
@@ -37,7 +37,7 @@ def load_early_stop_improved():
             namespace = {}
             exec(compile(module, train_path, "exec"), namespace)
             return namespace["early_stop_improved"]
-    raise AssertionError("early_stop_improved not found in train.py")
+    raise AssertionError("early_stop_improved not found in train_local.py")
 
 
 early_stop_improved = load_early_stop_improved()

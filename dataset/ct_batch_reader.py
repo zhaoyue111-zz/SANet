@@ -2,7 +2,7 @@
 """CT-centric train batch dataset for I/O speed experiments.
 
 One dataset item = one positive CT = one full batch, with a single np.load.
-Enabled via train.py --sample-by-ct (train only). Val/eval/test keep BboxReader.
+Enabled via train_local.py --sample-by-ct (train only). Val/eval/test keep BboxReader.
 """
 
 from __future__ import annotations
