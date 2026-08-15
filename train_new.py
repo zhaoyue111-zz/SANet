@@ -587,6 +587,7 @@ def main():
             target_spacing_zyx=target_spacing_zyx,
             window_min=args.window_min,
             window_max=args.window_max,
+            train_neg_pos_ratio=args.train_neg_pos_ratio,
         )
     elif args.sample_by_ct:
         train_dataset = build_ct_batch_datasets(
@@ -609,6 +610,10 @@ def main():
             train_neg_pos_ratio=args.train_neg_pos_ratio,
         )
         val_dataset = build_split_dataset(args.dataset, 'val')
+    # Keep a reference to the organized dataset because limit_dataset may wrap
+    # it in a Subset, while epoch-dependent lesion grouping belongs to the
+    # underlying dataset.
+    organized_epoch_dataset = train_dataset if organized_requested else None
     train_dataset = limit_dataset(train_dataset, args.limit_train_samples)
     val_dataset = limit_dataset(val_dataset, args.limit_val_samples)
 
@@ -761,6 +766,8 @@ def main():
     for i in tqdm(range(start_epoch, epochs + 1), desc='Total', disable=not is_main_process(args)):
         if train_sampler is not None:
             train_sampler.set_epoch(i)
+        if organized_epoch_dataset is not None:
+            organized_epoch_dataset.set_epoch(i)
         # learning rate schedule
         if isinstance(optimizer, torch.optim.SGD):
             base_lr = lr_schdule(i, init_lr=init_lr, total=epochs)
