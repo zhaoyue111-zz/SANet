@@ -12,7 +12,7 @@ import numpy as np
 
 
 def load_detection_meter_functions():
-    train_path = os.path.join(ROOT_DIR, "train_local.py")
+    train_path = os.path.join(ROOT_DIR, "train.py")
     with open(train_path, "r", encoding="utf-8") as f:
         tree = ast.parse(f.read(), filename=train_path)
     wanted = {

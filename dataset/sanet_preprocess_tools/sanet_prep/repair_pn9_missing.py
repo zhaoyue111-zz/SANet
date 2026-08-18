@@ -241,10 +241,3 @@ def build_argparser() -> argparse.ArgumentParser:
 if __name__ == "__main__":
     repair_missing(build_argparser().parse_args())
 
-'''
-python -m sanet_prep.repair_pn9_missing \
-    --sanet-dir /data/医保大赛/code/SANet/data/PN9 \
-    --pid-map-csv /data/医保大赛/code/SANet/data/PN9/missing_pn9_files.csv \
-    --pn9-root '/media/SENSETIME\yangtingting/T7/医保大赛数据/PN9/npy' \
-    --lung-mask-root '/media/SENSETIME\yangtingting/T7/医保大赛数据/lungseg/PN9'
-'''

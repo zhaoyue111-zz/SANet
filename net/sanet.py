@@ -516,11 +516,11 @@ class SANet(nn.Module):
         self.mask_probs = []
         if self.use_rcnn:
             if len(self.rpn_proposals) > 0:
-                proposal = self.rpn_proposals[:, [0, 2, 3, 4, 5, 6, 7]].cpu().numpy().copy()
+                proposal = self.rpn_proposals[:, [0, 2, 3, 4, 5, 6, 7]].cpu().numpy().copy() # [b, z,y,x,d,h,w]
                 proposal[:, 1:] = center_box_to_coord_box(proposal[:, 1:])
                 proposal = proposal.astype(np.int64)
-                proposal[:, 1:] = ext2factor(proposal[:, 1:], 4)
-                proposal[:, 1:] = clip_boxes(proposal[:, 1:], inputs.shape[2:])
+                proposal[:, 1:] = ext2factor(proposal[:, 1:], 4) # 角点对齐到4的倍数
+                proposal[:, 1:] = clip_boxes(proposal[:, 1:], inputs.shape[2:]) # clip到CT体积内，
                 # # rcnn_crops = self.rcnn_crop(features, inputs, torch.from_numpy(proposal).cuda())
                 # features = [t.unsqueeze(0).expand(internal_parallel_size(), -1, -1, -1, -1, -1) for t in features]
                 rcnn_crops = data_parallel(self.rcnn_crop, (features, inputs, torch.from_numpy(proposal).cuda()))

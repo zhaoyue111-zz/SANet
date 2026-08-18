@@ -339,28 +339,53 @@ class OrganizedNPZCTDataset(CTBatchDataset):
             rng = np.random.default_rng(self.seed + self.epoch)
             self._train_items = []
 
-            # Key change: one randomly selected positive series per patient per
-            # epoch.  Downstream lesion chunking/batch construction is unchanged.
+            # One randomly selected positive series per patient per epoch.
+            # Each selected series contributes exactly ONE training batch.
             self.selected_train_ct_indices = self._select_one_positive_series_per_patient(rng)
-            self.selected_train_lesions = int(
-                sum(len(self.positives_by_ct[ct_index]) for ct_index in self.selected_train_ct_indices)
-            )
+            self.selected_train_lesions = 0
 
             for ct_index in self.selected_train_ct_indices:
                 lesion_indices = np.arange(
                     len(self.positives_by_ct[ct_index]), dtype=np.int64
                 )
-                rng.shuffle(lesion_indices)
-                for start in range(0, len(lesion_indices), self.n_pos):
-                    group = lesion_indices[start:start + self.n_pos].tolist()
-                    selected = [(int(lesion_index), False) for lesion_index in group]
+
+                # One patient / one selected series / one batch per epoch.
+                # Keep the original n_pos:n_neg batch composition unchanged.
+                if len(lesion_indices) >= self.n_pos:
+                    chosen = rng.choice(
+                        lesion_indices,
+                        size=self.n_pos,
+                        replace=False,
+                    )
+                    selected = [
+                        (int(lesion_index), False)
+                        for lesion_index in chosen
+                    ]
+                else:
+                    # If this series has fewer than n_pos lesions, use every real
+                    # lesion once, then repeat lesions to fill the positive slots.
+                    shuffled = lesion_indices.copy()
+                    rng.shuffle(shuffled)
+
+                    selected = [
+                        (int(lesion_index), False)
+                        for lesion_index in shuffled
+                    ]
+
                     missing = self.n_pos - len(selected)
                     if missing:
-                        fillers = rng.choice(lesion_indices, size=missing, replace=True)
-                        selected.extend(
-                            (int(lesion_index), True) for lesion_index in fillers
+                        fillers = rng.choice(
+                            lesion_indices,
+                            size=missing,
+                            replace=True,
                         )
-                    self._train_items.append((ct_index, selected))
+                        selected.extend(
+                            (int(lesion_index), True)
+                            for lesion_index in fillers
+                        )
+
+                self.selected_train_lesions += len(selected)
+                self._train_items.append((ct_index, selected))
         else:
             self._val_items = []
             for ct_index in self.pos_ct_indices:

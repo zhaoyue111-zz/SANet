@@ -7,9 +7,9 @@ import pandas as pd
 
 
 BBOX_COLUMNS = [
-    "z_min", "z_max",
-    "y_min", "y_max",
-    "x_min", "x_max",
+    "zmin", "zmax",
+    "ymin", "ymax",
+    "xmin", "xmax",
 ]
 
 
@@ -58,9 +58,9 @@ def collect_longest_sides(data_root):
         bbox = bbox.loc[valid_mask].copy()
 
         # 计算三个方向的边长
-        z_length = bbox["z_max"] - bbox["z_min"]
-        y_length = bbox["y_max"] - bbox["y_min"]
-        x_length = bbox["x_max"] - bbox["x_min"]
+        z_length = bbox["zmax"] - bbox["zmin"]
+        y_length = bbox["ymax"] - bbox["ymin"]
+        x_length = bbox["xmax"] - bbox["xmin"]
 
         # 排除边长小于等于0的无效框
         positive_mask = (
@@ -173,13 +173,24 @@ def plot_distribution(data_root, output_dir):
     figure_width = max(12, min(30, len(value_range) * 0.35))
     plt.figure(figsize=(figure_width, 7))
 
-    plt.bar(
+    bars = plt.bar(
         value_range,
         counts.to_numpy(),
         width=4.5,
         color="#4C78A8",
         edgecolor="black",
         linewidth=0.5,
+    )
+
+    # 在每个非零柱子上方标注数量
+    plt.bar_label(
+        bars,
+        labels=[
+            str(count) if count > 0 else ""
+            for count in counts.to_numpy()
+        ],
+        padding=3,
+        fontsize=8
     )
 
     plt.xlabel("Longest side (rounded to nearest 5)")
@@ -220,5 +231,5 @@ if __name__ == "__main__":
     )
 
 '''
-python tools/plot_longest_side.py /data/医保大赛/code/SANet/data
+python tools/plot_longest_side.py /mnt/afs2/data
 '''

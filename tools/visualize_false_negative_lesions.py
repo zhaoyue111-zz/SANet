@@ -18,8 +18,8 @@ import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
 
 
-DEFAULT_RESULT_DIR = Path("test_output/res/14_pretrained_rcnn20")
-DEFAULT_DATA_ROOT = Path("data")
+DEFAULT_RESULT_DIR = Path("test_output/res/73_pretrained_hardsamples_rcnn40_PN11_v4_ensemble")
+DEFAULT_DATA_ROOT = Path("/mnt/afs2/data")
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--eval-subdir",
-        default="res_froc_eval",
+        default="res_froc_eval_diamter05",
         help="FROC evaluation subdirectory containing FNs.csv.",
     )
     parser.add_argument(
@@ -429,8 +429,9 @@ if __name__ == "__main__":
 Examples:
 
 python tools/visualize_false_negative_lesions.py \
-    --result-dir test_output/res/14_pretrained_rcnn20 \
-    --data-root data
+    --result-dir test_output_v3/res/48 \
+    --data-root data \
+    --dataset LUNA16
 
 python tools/visualize_false_negative_lesions.py \
     --result-dir test_output/res/14_pretrained_rcnn20 \

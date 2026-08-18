@@ -6,6 +6,8 @@
 *.npz
 *.pth
 *.csv
+*.ckpt
+*.so
 train_output/
 test_output/
 
@@ -23,3 +25,4 @@ train_hard_examples/per_dataset/*/FROC/*.csv
 
 # Generated hard-example files
 train_hard_examples/hard_fps*.csv
+

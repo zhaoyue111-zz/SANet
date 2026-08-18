@@ -163,7 +163,7 @@ def build_argparser():
     )
     parser.add_argument(
         "--sanet-dir",
-        default="/data/医保大赛/code/SANet/data/PN9",
+        default="/mnt/afs2/data/PN9",
     )
     parser.add_argument("--pid", type=int, default=9448)
     parser.add_argument("--nodule-id", type=int, default=None,help="pid对应的病例的结节id，在split/all_anno_3D.csv中可以查看；不指定默认选择第一个")

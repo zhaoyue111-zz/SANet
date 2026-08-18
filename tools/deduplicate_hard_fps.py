@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 
-DEFAULT_INPUT = "/data/医保大赛/code/SANet/train_hard_examples/hard_fps.csv"
+DEFAULT_INPUT = "/mnt/afs2/code/SANet/hard_examples_v3/train/hard_fps.csv"
 DEFAULT_IOM_THRESHOLD = 0.50
 DEFAULT_DISTANCE_THRESHOLD = 0.5
 EPS = 1e-6

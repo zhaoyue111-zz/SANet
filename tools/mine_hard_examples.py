@@ -10,8 +10,11 @@ sys.path.insert(0, ROOT_DIR)
 sys.path.insert(0, os.path.join(ROOT_DIR, 'build/box'))
 
 '''
-对原训练集推理,调用 evaluationScript/noduleCADEvaluationLUNA16.py,汇总输出：hard_examples/hard_fps.csv
-hard_examples/hard_fns.csv
+对原训练集进行 RPN 推理，调用 evaluationScript/noduleCADEvaluationLUNA16.py，
+汇总输出：
+    hard_examples/hard_tps.csv
+    hard_examples/hard_fps.csv
+    hard_examples/hard_fns.csv
 '''
 
 def preset_cuda_visible_devices():
@@ -94,7 +97,7 @@ def clear_inference_cache(net):
 
 
 def prepare_evaluation_annotations(annotation_path, eval_dir):
-    annotations = pd.read_csv(annotation_path)
+    annotations = pd.read_csv(annotation_path, dtype={'pid': str})
     center_columns = {'center_x', 'center_y', 'center_z', 'diameter'}
     if not center_columns.issubset(annotations.columns):
         corner_columns = {'xmin', 'xmax', 'ymin', 'ymax', 'zmin', 'zmax'}
@@ -132,7 +135,7 @@ def pid_keys(value):
 
 
 def annotation_lookup(annotation_path):
-    annos = pd.read_csv(annotation_path)
+    annos = pd.read_csv(annotation_path, dtype={'pid': str})
     if not {'center_x', 'center_y', 'center_z', 'diameter'}.issubset(annos.columns):
         annos['center_x'] = (annos['xmin'] + annos['xmax']) / 2.
         annos['center_y'] = (annos['ymin'] + annos['ymax']) / 2.
@@ -173,7 +176,7 @@ def match_fn_to_gt(fn_row, annos_by_pid):
 
 
 def read_fps(dataset_name, fp_csv, fp_threshold):
-    df = pd.read_csv(fp_csv)
+    df = pd.read_csv(fp_csv, dtype={'seriesuid': str})
     out = []
     for _, row in df.iterrows():
         probability = float(row['probability']) if pd.notna(row['probability']) else 0.0
@@ -192,8 +195,61 @@ def read_fps(dataset_name, fp_csv, fp_threshold):
     return out
 
 
+def read_tps(dataset_name, tp_csv, annotation_path):
+    """Read evaluator TPs and attach the matched GT box.
+
+    TPs.csv stores the highest-scoring RPN candidate selected for each detected
+    GT.  The evaluator does not write the GT box into that CSV, so we match the
+    candidate back to the nearest annotation from the same pid.
+    """
+    df = pd.read_csv(tp_csv, dtype={'seriesuid': str})
+    annos_by_pid = annotation_lookup(annotation_path)
+    out = []
+
+    for nodule_id, row in df.iterrows():
+        gt = match_fn_to_gt(row, annos_by_pid)
+        if gt is None:
+            print('[WARN] TP pid not found in annotations: %s' % row['seriesuid'])
+            continue
+
+        probability = float(row['probability']) if pd.notna(row['probability']) else 0.0
+        pred_radius = float(row['radius']) if pd.notna(row['radius']) else 0.0
+        pred_center = np.asarray(
+            [row['coordX'], row['coordY'], row['coordZ']], dtype=np.float32
+        )
+        gt_center = np.asarray(
+            [gt['center_x'], gt['center_y'], gt['center_z']], dtype=np.float32
+        )
+
+        out.append({
+            'dataset': dataset_name,
+            'pid': str(gt['pid']),
+            'zmin': float(gt['zmin']),
+            'zmax': float(gt['zmax']),
+            'ymin': float(gt['ymin']),
+            'ymax': float(gt['ymax']),
+            'xmin': float(gt['xmin']),
+            'xmax': float(gt['xmax']),
+            'nodule_id': int(nodule_id),
+            # GT information
+            'center_x': float(gt['center_x']),
+            'center_y': float(gt['center_y']),
+            'center_z': float(gt['center_z']),
+            'diameter': float(gt['diameter']),
+            # Highest-scoring matched RPN candidate selected by the evaluator
+            'probability': probability,
+            'pred_center_x': float(row['coordX']),
+            'pred_center_y': float(row['coordY']),
+            'pred_center_z': float(row['coordZ']),
+            'pred_diameter': pred_radius * 2.0,
+            'center_distance': float(np.linalg.norm(pred_center - gt_center)),
+        })
+
+    return out
+
+
 def read_fns(dataset_name, fn_csv, annotation_path):
-    df = pd.read_csv(fn_csv)
+    df = pd.read_csv(fn_csv, dtype={'seriesuid': str})
     annos_by_pid = annotation_lookup(annotation_path)
     out = []
     for nodule_id, row in df.iterrows():
@@ -248,10 +304,10 @@ def infer_dataset(net, dataset_cfg, out_dir, num_workers):
     os.makedirs(res_dir, exist_ok=True)
 
     eval_cfg = dict(dataset_cfg)
-    eval_cfg['test_anno'] = dataset_cfg['train_anno']
+    eval_cfg['test_anno'] = dataset_cfg['val_anno']
     eval_cfg['hard_fp_csv'] = None
     eval_cfg['hard_fn_csv'] = None
-    dataset = BboxReader(eval_cfg['DATA_DIR'], eval_cfg['train_set_list'], eval_cfg, mode='eval')
+    dataset = BboxReader(eval_cfg['DATA_DIR'], eval_cfg['val_set_list'], eval_cfg, mode='eval')
     loader = DataLoader(
         dataset,
         batch_size=1,
@@ -298,16 +354,21 @@ def infer_dataset(net, dataset_cfg, out_dir, num_workers):
     result_path = os.path.join(eval_dir, 'results.csv')
     result_df.to_csv(result_path, index=False)
 
-    annotations_path = prepare_evaluation_annotations(dataset_cfg['train_anno'], eval_dir)
-    noduleCADEvaluation(annotations_path, result_path, dataset_cfg['train_set_list'], res_dir)
-    return annotations_path, os.path.join(res_dir, 'FPs.csv'), os.path.join(res_dir, 'FNs.csv')
+    annotations_path = prepare_evaluation_annotations(dataset_cfg['val_anno'], eval_dir)
+    noduleCADEvaluation(annotations_path, result_path, dataset_cfg['val_set_list'], res_dir)
+    return (
+        annotations_path,
+        os.path.join(res_dir, 'TPs.csv'),
+        os.path.join(res_dir, 'FPs.csv'),
+        os.path.join(res_dir, 'FNs.csv'),
+    )
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Mine hard FP/FN samples from the training set.')
+    parser = argparse.ArgumentParser(description='Mine RPN TP/FP/FN samples from the training set.')
     parser.add_argument('--dataset', default='all', help="dataset name under data/, or 'all'")
     parser.add_argument('--ckpt', default='/mnt/afs2/code/SANet/train_pretrained_hardsamples_rcnn40_PN11_v3_lt1002/model/best_rcnn.ckpt', help='checkpoint used for mining')
-    parser.add_argument('--out-dir', default='hard_examples_train_v3', help='directory to save mined CSVs')
+    parser.add_argument('--out-dir', default='hard_examples_val_v3', help='directory to save mined CSVs')
     parser.add_argument('--fp-threshold', type=float, default=0.9, help='minimum FP probability to keep')
     parser.add_argument('--num-workers', type=int, default=0, help='DataLoader workers')
     parser.add_argument('--gpu', default=None, help='CUDA_VISIBLE_DEVICES value')
@@ -323,21 +384,36 @@ def main():
     cfgs = dataset_configs(args.dataset, skip_missing=(args.dataset == 'all'))
     net = load_model(args.ckpt)
 
+    all_tps = []
     all_fps = []
     all_fns = []
     for dataset_cfg in cfgs:
         try:
-            annotations_path, fp_csv, fn_csv = infer_dataset(net, dataset_cfg, args.out_dir, args.num_workers)
+            annotations_path, tp_csv, fp_csv, fn_csv = infer_dataset(
+                net, dataset_cfg, args.out_dir, args.num_workers
+            )
         except (FileNotFoundError, ValueError) as exc:
             if args.dataset != 'all':
                 raise
             print('[%s] Skip mining: %s' % (dataset_cfg['dataset'], exc))
             continue
+        all_tps.extend(read_tps(dataset_cfg['dataset'], tp_csv, annotations_path))
         all_fps.extend(read_fps(dataset_cfg['dataset'], fp_csv, args.fp_threshold))
         all_fns.extend(read_fns(dataset_cfg['dataset'], fn_csv, annotations_path))
 
+    tp_out = os.path.join(args.out_dir, 'hard_tps.csv')
     fp_out = os.path.join(args.out_dir, 'hard_fps.csv')
     fn_out = os.path.join(args.out_dir, 'hard_fns.csv')
+
+    pd.DataFrame(
+        all_tps,
+        columns=[
+            'dataset', 'pid', 'zmin', 'zmax', 'ymin', 'ymax', 'xmin', 'xmax',
+            'nodule_id', 'center_x', 'center_y', 'center_z', 'diameter',
+            'probability', 'pred_center_x', 'pred_center_y', 'pred_center_z',
+            'pred_diameter', 'center_distance',
+        ],
+    ).to_csv(tp_out, index=False)
     pd.DataFrame(
         all_fps,
         columns=['dataset', 'pid', 'center_x', 'center_y', 'center_z', 'diameter', 'probability'],
@@ -349,6 +425,7 @@ def main():
             'nodule_id', 'center_x', 'center_y', 'center_z', 'diameter', 'probability',
         ],
     ).to_csv(fn_out, index=False)
+    print('Saved TP csv: %s (%d rows)' % (tp_out, len(all_tps)))
     print('Saved hard FP csv: %s (%d rows, threshold %.3f)' % (fp_out, len(all_fps), args.fp_threshold))
     print('Saved hard FN csv: %s (%d rows)' % (fn_out, len(all_fns)))
 

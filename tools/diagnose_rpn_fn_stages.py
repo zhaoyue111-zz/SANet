@@ -62,8 +62,13 @@ def enable_cpu_fallback():
 
 def canonical_pid(value):
     text = str(value).strip()
+
     if text.endswith(".0"):
         text = text[:-2]
+
+    if text.isdigit():
+        return text.zfill(5)
+
     return text
 
 
@@ -78,7 +83,8 @@ def pid_aliases(value):
 
 
 def load_annotations(path):
-    ann = pd.read_csv(path)
+    ann = pd.read_csv(path,dtype={"pid": str, "seriesuid": str},)
+    ann["pid"] = ann["pid"].map(canonical_pid)
 
     if "pid" not in ann.columns:
         if "seriesuid" in ann.columns:
@@ -412,7 +418,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Locate the filtering stage responsible for SANet/LUNA16 false negatives."
     )
-    parser.add_argument("--dataset", default="LUNA16", help="Dataset directory name under DATA_ROOT.")
+    parser.add_argument("--dataset", default="PN9", help="Dataset directory name under DATA_ROOT.")
     parser.add_argument("--weight", required=True, help="SANet checkpoint path.")
     parser.add_argument("--out-dir", required=True, help="Directory for diagnosis CSV files.")
     parser.add_argument("--test-set-name", default=None, help="Optional test split override.")
@@ -522,3 +528,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+'''
+python tools/diagnose_rpn_fn_stages.py --weight /mnt/afs2/code/SANet/train_pretrained_hardsamples_rcnn40_PN11_v3_lt1002/model/best_rcnn.ckpt --out-dir fn_status_PN9 --fn-csv /mnt/afs2/code/SANet/test_output_v3/res/48/PN9/FROC/res_froc_eval_diamter05/FNs.csv --save-stage-npy
+'''

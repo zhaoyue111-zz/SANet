@@ -475,3 +475,13 @@ if __name__ == "__main__":
     except Exception:
         traceback.print_exc()
         raise
+
+'''
+cd /mnt/afs2/code/SANet
+
+python test_instance.py \
+  --dataset LUNA16 \
+  --pid 00291 \
+  --weight /mnt/afs2/code/SANet/train_pretrained_hardsamples_rcnn40_PN11_v3_lt1002/model/best_rcnn.ckpt \
+  --out-dir /mnt/afs2/code/SANet/test_instance_output
+'''

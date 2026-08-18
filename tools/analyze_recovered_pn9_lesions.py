@@ -15,8 +15,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 DEFAULT_RCNN_DIR = Path("test_output/res/48_pretrained_hardsamples_rcnn40_PN11_v3_lt1002")
 DEFAULT_ENSEMBLE_DIR = Path("test_output/res/48_pretrained_hardsamples_rcnn40_PN11_v3_lt1002_ensemble")
-DEFAULT_DATA_DIR = Path("data/PN9")
-DEFAULT_OUT_DIR = Path("test_output/analysis/pn9_recovered_by_ensemble")
+DEFAULT_DATA_DIR = Path("/mnt/afs2/data/PN9")
+DEFAULT_OUT_DIR = Path("test_output/analysis/pn9_recovered_by_ensemble/v3")
 
 
 def parse_args() -> argparse.Namespace:

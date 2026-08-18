@@ -587,10 +587,11 @@ def noduleCADEvaluation(annotations_filename, annotations_excluded_filename, ser
     (allNodules, seriesUIDs) = collect(annotations_filename,
                                        annotations_excluded_filename, seriesuids_filename)
     os.makedirs(outputDir, exist_ok=True)
+
     _, listTPs, listFPs, listFNs = evaluateCAD(
         seriesUIDs, results_filename, outputDir, allNodules,
         os.path.splitext(os.path.basename(results_filename))[0],
-        maxNumberOfCADMarks=300, performBootstrapping=bPerformBootstrapping,
+        maxNumberOfCADMarks=200, performBootstrapping=bPerformBootstrapping,
         numberOfBootstrapSamples=bNumberOfBootstrapSamples,
         confidence=bConfidence)
 
@@ -672,10 +673,12 @@ if __name__ == '__main__':
     print(60 * "<")
 
 '''
+python tools/prepare_froc_evaluation_inputs.py test_output/res/14_pretrained_rcnn20/PN9
+
 python froc_evaluation/noduleCADEvaluationLUNA16.py \
-    test_output/res/14_pretrained_rcnn20/LNDB/FROC/annotations.csv \
-    test_output/res/14_pretrained_rcnn20/LNDB/FROC/annotations_excluded.csv \
-    test_output/res/14_pretrained_rcnn20/LNDB/FROC/seriesuids.csv \
-    test_output/res/14_pretrained_rcnn20/LNDB/FROC/results.csv \
-    test_output/res/14_pretrained_rcnn20/LNDB/FROC/res_froc_eval
+    test_output/res/14_pretrained_rcnn20_th05_nms01/LUNA25/FROC/annotations_froc_eval.csv \
+    test_output/res/14_pretrained_rcnn20_th05_nms01/LUNA25/FROC/annotations_excluded.csv \
+    test_output/res/14_pretrained_rcnn20_th05_nms01/LUNA25/FROC/seriesuids.csv \
+    test_output/res/14_pretrained_rcnn20_th05_nms01/LUNA25/FROC/results_froc_eval.csv \
+    test_output/res/14_pretrained_rcnn20_th05_nms01/LUNA25/FROC/res_froc_eval_diamter05
 '''

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert LUNA25 nodule masks into original-resolution bbox annotations.
+"""Convert LUNA25 nodule masks into tensorflow-space bbox annotations.
 
 Reads:
   - luna25_npz/*.npz  (1mm cropped working volumes)
@@ -8,8 +8,8 @@ Reads:
 Writes:
   - luna25_npz/annotation.csv
 
-Coordinates are inclusive pixel indices on the original CT grid (ZYX).
-``pid`` is a stable zero-based index assigned to sorted NPZ files.
+Coordinates are inclusive pixel indices on the npz ``image`` volume (ZYX, ~1mm).
+``pid`` is the npz path relative to the SANet repo root.
 """
 
 from __future__ import annotations
@@ -36,15 +36,55 @@ def _as_scalar_str(value) -> str:
     return str(value)
 
 
-def validate_original_mask(nodule_zyx: np.ndarray, d: dict) -> np.ndarray:
-    """Validate that a nodule mask is already on the original full CT grid."""
+def build_full_reference(d: dict) -> sitk.Image:
+    full_shape = tuple(np.asarray(d["image_shape_original"][0], dtype=int))
+    ref = sitk.GetImageFromArray(np.zeros(full_shape, np.uint8))
+    ref.SetSpacing(np.asarray(d["spacing"], dtype=float)[::-1].tolist())
+    ref.SetOrigin(np.asarray(d["origin"], dtype=float)[::-1].tolist())
+    ref.SetDirection(np.asarray(d["direction"], dtype=float)[::-1].tolist())
+    return ref
+
+
+def nodule_mask_to_work_space(nodule_zyx: np.ndarray, d: dict) -> np.ndarray:
+    """Map full-grid nodule mask into the 1mm working volume grid of ``d['image']``."""
     full_shape = tuple(np.asarray(d["image_shape_original"][0], dtype=int))
     if tuple(nodule_zyx.shape) != full_shape:
         raise ValueError(
             "Nodule mask shape %s != original CT shape %s"
             % (nodule_zyx.shape, full_shape)
         )
-    return np.asarray(nodule_zyx)
+
+    sref = build_full_reference(d)
+    nodule_img = sitk.GetImageFromArray(np.asarray(nodule_zyx, dtype=np.uint8))
+    nodule_img.CopyInformation(sref)
+
+    box = np.asarray(d["mask_size_original"], dtype=int)  # ZYX rows, [start, end)
+    crop_start_xyz = box[:, 0][::-1]
+    crop_end_xyz = box[:, 1][::-1]
+    crop = sitk.RegionOfInterest(
+        nodule_img,
+        (crop_end_xyz - crop_start_xyz).tolist(),
+        crop_start_xyz.tolist(),
+    )
+
+    work_shape = tuple(np.asarray(d["image"]).shape)  # ZYX
+    work_ref = sitk.Image(
+        [int(work_shape[2]), int(work_shape[1]), int(work_shape[0])],
+        sitk.sitkUInt8,
+    )
+    work_ref.SetSpacing((1.0, 1.0, 1.0))
+    work_ref.SetOrigin(crop.GetOrigin())
+    work_ref.SetDirection(crop.GetDirection())
+
+    resampled = sitk.Resample(
+        crop,
+        work_ref,
+        sitk.Transform(),
+        sitk.sitkNearestNeighbor,
+        0.0,
+        sitk.sitkUInt8,
+    )
+    return sitk.GetArrayFromImage(resampled)
 
 
 def extract_bboxes(mask_zyx: np.ndarray, min_voxels: int = 1) -> List[Tuple[int, int, int, int, int, int, int]]:
@@ -67,7 +107,15 @@ def extract_bboxes(mask_zyx: np.ndarray, min_voxels: int = 1) -> List[Tuple[int,
     return boxes
 
 
-def process_one(npz_path: str, mask_dir: str, pid_start: int) -> List[dict]:
+def relative_pid(npz_path: str, repo_root: str = REPO_ROOT) -> str:
+    abs_path = os.path.abspath(npz_path)
+    try:
+        return os.path.relpath(abs_path, repo_root)
+    except ValueError:
+        return abs_path
+
+
+def process_one(npz_path: str, mask_dir: str, repo_root: str) -> List[dict]:
     d = dict(np.load(npz_path, allow_pickle=True))
     uid = _as_scalar_str(d.get("seriesUID", os.path.splitext(os.path.basename(npz_path))[0]))
     mask_path = os.path.join(mask_dir, "%s_nodule_mask.nii.gz" % uid)
@@ -75,13 +123,13 @@ def process_one(npz_path: str, mask_dir: str, pid_start: int) -> List[dict]:
         raise FileNotFoundError("Missing nodule mask: %s" % mask_path)
 
     nodule = sitk.GetArrayFromImage(sitk.ReadImage(mask_path))
-    original_mask = validate_original_mask(nodule, d)
+    work_mask = nodule_mask_to_work_space(nodule, d)
+    pid = relative_pid(npz_path, repo_root)
 
     rows = []
-    for local_i, (n_vox, z0, y0, x0, z1, y1, x1) in enumerate(
-            extract_bboxes(original_mask, min_voxels=1)):
+    for n_vox, z0, y0, x0, z1, y1, x1 in extract_bboxes(work_mask, min_voxels=1):
         rows.append({
-            "pid": pid_start + local_i,
+            "pid": pid,
             "bbox_min_z": z0,
             "bbox_min_y": y0,
             "bbox_min_x": x0,
@@ -99,8 +147,7 @@ def main():
     parser.add_argument("--npz-dir", default=DEFAULT_NPZ_DIR, help="Directory of *_buffer / UID.npz files")
     parser.add_argument("--mask-dir", default=DEFAULT_MASK_DIR, help="Directory of {UID}_nodule_mask.nii.gz")
     parser.add_argument("--out-csv", default=DEFAULT_OUT_CSV, help="Output annotation CSV path")
-    parser.add_argument("--repo-root", default=REPO_ROOT,
-                        help="Retained for command-line compatibility; not used for numeric pid")
+    parser.add_argument("--repo-root", default=REPO_ROOT, help="Repo root used for relative pid paths")
     parser.add_argument("--keep-meta", action="store_true",
                         help="Keep helper columns voxel_count/seriesUID in CSV")
     args = parser.parse_args()
@@ -115,20 +162,14 @@ def main():
 
     all_rows = []
     skipped = []
-    next_pid = 0
-    for npz_index, npz_path in enumerate(npz_files):
+    for i, npz_path in enumerate(npz_files, 1):
         try:
-            rows = process_one(npz_path, args.mask_dir, next_pid)
+            rows = process_one(npz_path, args.mask_dir, args.repo_root)
             all_rows.extend(rows)
-            pid_end = next_pid + len(rows) - 1
-            print("[%d/%d] pid=%d..%d %s -> %d nodule(s)"
-                  % (npz_index + 1, len(npz_files), next_pid, pid_end,
-                     os.path.basename(npz_path), len(rows)))
-            next_pid += len(rows)
+            print("[%d/%d] %s -> %d nodule(s)" % (i, len(npz_files), os.path.basename(npz_path), len(rows)))
         except Exception as exc:
             skipped.append((npz_path, str(exc)))
-            print("[%d/%d] SKIP %s: %s"
-                  % (npz_index + 1, len(npz_files), os.path.basename(npz_path), exc))
+            print("[%d/%d] SKIP %s: %s" % (i, len(npz_files), os.path.basename(npz_path), exc))
 
     if not all_rows:
         raise RuntimeError("No annotations produced. Skipped=%d" % len(skipped))
