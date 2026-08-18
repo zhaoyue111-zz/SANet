@@ -1,8 +1,12 @@
 """CT-level reader for the organized LUNA25 NPZ layout.
 
-The organized reader keeps the legacy CT-level crop/finalization path, while
-allowing one CT to contribute several items during an epoch.  Every item
-loads its NPZ exactly once.
+For training, each epoch randomly selects exactly one positive series per
+patient, then keeps the legacy series-level lesion chunking/crop/finalization
+path unchanged.  All real lesions from the selected series participate in the
+epoch; the final incomplete positive group is padded with the existing
+simple-augmentation duplicate logic.
+
+Validation keeps all positive series unchanged.
 """
 
 from __future__ import annotations
@@ -95,7 +99,7 @@ def _check_split_isolation(train_entries, val_entries, train_path, val_path):
 
 
 class OrganizedNPZCTDataset(CTBatchDataset):
-    """CT-level organized NPZ dataset with deterministic epoch chunking."""
+    """CT-level organized NPZ dataset with patient-level epoch series sampling."""
 
     def __init__(
         self,
@@ -273,6 +277,19 @@ class OrganizedNPZCTDataset(CTBatchDataset):
         self.pos_ct_indices = [
             index for index, boxes in self.positives_by_ct.items() if len(boxes) > 0
         ]
+
+        # Training-only patient -> positive-series map.  The legacy organized
+        # reader already ignored zero-annotation series because it iterated only
+        # over pos_ct_indices.  Restricting the random candidate pool to positive
+        # series therefore preserves the existing training semantics.
+        self.positive_ct_indices_by_patient = {}
+        for ct_index in self.pos_ct_indices:
+            patient_id = self.case_metadata[ct_index]["patient_id"]
+            self.positive_ct_indices_by_patient.setdefault(patient_id, []).append(ct_index)
+        self.positive_patient_ids = sorted(self.positive_ct_indices_by_patient)
+        self.selected_train_ct_indices = []
+        self.selected_train_lesions = 0
+
         self.train_neg_pos_ratio = float(train_neg_pos_ratio)
         self.n_pos, self.n_neg = split_pos_neg_counts(
             self.batch_size, self.train_neg_pos_ratio
@@ -306,12 +323,33 @@ class OrganizedNPZCTDataset(CTBatchDataset):
         from dataset.bbox_reader import Crop
         return Crop(self.cfg)
 
+    def _select_one_positive_series_per_patient(self, rng):
+        """Choose exactly one positive series for every positive patient."""
+        selected = []
+        for patient_id in self.positive_patient_ids:
+            candidates = self.positive_ct_indices_by_patient[patient_id]
+            if len(candidates) == 1:
+                selected.append(int(candidates[0]))
+            else:
+                selected.append(int(candidates[int(rng.integers(len(candidates)))]))
+        return selected
+
     def _rebuild_items(self):
         if self.mode == "train":
             rng = np.random.default_rng(self.seed + self.epoch)
             self._train_items = []
-            for ct_index in self.pos_ct_indices:
-                lesion_indices = np.arange(len(self.positives_by_ct[ct_index]), dtype=np.int64)
+
+            # Key change: one randomly selected positive series per patient per
+            # epoch.  Downstream lesion chunking/batch construction is unchanged.
+            self.selected_train_ct_indices = self._select_one_positive_series_per_patient(rng)
+            self.selected_train_lesions = int(
+                sum(len(self.positives_by_ct[ct_index]) for ct_index in self.selected_train_ct_indices)
+            )
+
+            for ct_index in self.selected_train_ct_indices:
+                lesion_indices = np.arange(
+                    len(self.positives_by_ct[ct_index]), dtype=np.int64
+                )
                 rng.shuffle(lesion_indices)
                 for start in range(0, len(lesion_indices), self.n_pos):
                     group = lesion_indices[start:start + self.n_pos].tolist()
@@ -319,7 +357,9 @@ class OrganizedNPZCTDataset(CTBatchDataset):
                     missing = self.n_pos - len(selected)
                     if missing:
                         fillers = rng.choice(lesion_indices, size=missing, replace=True)
-                        selected.extend((int(lesion_index), True) for lesion_index in fillers)
+                        selected.extend(
+                            (int(lesion_index), True) for lesion_index in fillers
+                        )
                     self._train_items.append((ct_index, selected))
         else:
             self._val_items = []
@@ -333,10 +373,21 @@ class OrganizedNPZCTDataset(CTBatchDataset):
                     self._val_items.append((ct_index, selected))
 
     def set_epoch(self, epoch):
-        """Reshuffle train lesion groups deterministically for the given epoch."""
+        """Select one series/patient and reshuffle lesion groups for this epoch."""
         self.epoch = int(epoch)
         if self.mode == "train":
             self._rebuild_items()
+            print(
+                "[organized train] epoch %d: positive_patients=%d selected_series=%d "
+                "selected_lesions=%d train_batches=%d"
+                % (
+                    self.epoch,
+                    len(self.positive_patient_ids),
+                    len(self.selected_train_ct_indices),
+                    self.selected_train_lesions,
+                    len(self._train_items),
+                )
+            )
 
     def _resample_and_window(self, image, output_shape):
         image = np.asarray(image, dtype=np.float32)
@@ -445,7 +496,7 @@ class OrganizedNPZCTDataset(CTBatchDataset):
 
     @property
     def summary(self):
-        return {
+        summary = {
             "patients": len({metadata["patient_id"] for metadata in self.case_metadata}),
             "studies": len({
                 (metadata["patient_id"], metadata["studyInstanceUID"])
@@ -456,6 +507,13 @@ class OrganizedNPZCTDataset(CTBatchDataset):
             "lesions": int(sum(len(boxes) for boxes in self.sample_bboxes)),
             "%s_batches" % self.mode: len(self),
         }
+        if self.mode == "train":
+            summary.update({
+                "positive_patients": len(self.positive_patient_ids),
+                "selected_series": len(self.selected_train_ct_indices),
+                "selected_lesions": self.selected_train_lesions,
+            })
+        return summary
 
 
 def _print_split_summary(name, dataset):
@@ -463,6 +521,10 @@ def _print_split_summary(name, dataset):
     print("%s:" % name)
     for key in ("patients", "studies", "series", "zero_annotation_series", "lesions"):
         print("  %s: %d" % (key, summary[key]))
+    if name == "train" and "selected_series" in summary:
+        print("  positive_patients: %d" % summary["positive_patients"])
+        print("  selected_series(epoch=%d): %d" % (dataset.epoch, summary["selected_series"]))
+        print("  selected_lesions(epoch=%d): %d" % (dataset.epoch, summary["selected_lesions"]))
     print("  %s_batches: %d" % (name, summary["%s_batches" % name]))
 
 
