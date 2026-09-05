@@ -23,7 +23,7 @@ import time
 from dataset.collate import train_collate, test_collate, eval_collate, ct_batch_collate
 from dataset.bbox_reader import BboxReader
 from dataset.ct_batch_reader import build_ct_batch_datasets
-from dataset.organized_npz_reader import build_organized_npz_datasets
+from dataset.organized_npz_reader_yibao import build_organized_npz_datasets
 from utils.util import Logger
 from config import (
     train_config, data_config, net_config, config,
@@ -223,7 +223,7 @@ def distributed_merge_detection_meter(meter, args):
 
 
 parser = argparse.ArgumentParser(description='PyTorch Detector')
-parser.add_argument('--net', '-m', metavar='NET', default=train_config['net'],
+parser.add_argument('--net', '-n', metavar='NET', default=train_config['net'],
                     help='neural net')
 parser.add_argument('--epochs', default=train_config['epochs'], type=int, metavar='N',
                     help='number of total epochs to run')
@@ -245,7 +245,7 @@ parser.add_argument('--epoch-save', default=train_config['epoch_save'], type=int
                     help='save frequency')
 parser.add_argument('--early-stop-patience', default=train_config.get('early_stop_patience', 40), type=int,
                     help='Stop if the active FROC metric does not improve for this many epochs. <=0 disables.')
-parser.add_argument('--out-dir', default="train_output", type=str, metavar='OUT',
+parser.add_argument('--out-dir', default='train_output', type=str, metavar='OUT',
                     help='directory to save results of this training')
 parser.add_argument('--train-set', default=train_config['train_set_list'], nargs='+', type=str,
                     help='train set paths list')
@@ -265,15 +265,14 @@ parser.add_argument('--dataset', default=train_config['dataset'], type=str,
                     help="dataset name under data/, or 'all' for all SANet-ready datasets")
 parser.add_argument('--resume', action='store_true',
                     help='resume epoch and optimizer from checkpoint instead of using it as pretrained weights')
-parser.add_argument('--hard-fp-csv', nargs='+', type=str, default=None, help='One or more hard FP CSV files.')
-parser.add_argument('--hard-fn-csv', nargs='+', type=str, default=None, help='One or more hard FN CSV files.')
+parser.add_argument('--hard-fp-csv', nargs='+', type=str, default=None, help='One or more hard FP csv files.')
+parser.add_argument('--hard-fn-csv', nargs='+', type=str, default=None, help='One or more hard FN csv files.')
 parser.add_argument('--hard-fp-threshold', default=0.9, type=float,
-                    help='Minimum FP probability used by --hard-fp-csv. Default: 0.9.')
+                    help='Minimum FP probability used by --hard-fp-csv. Default: 0.9')
 parser.add_argument('--train-neg-pos-ratio', default=net_config.get('train_neg_pos_ratio', 1.0), type=float,
-                    help='Negative/positive sample ratio per training epoch. Clamped to [1/3, 1].')
+                    help='Negative positive sample ratio per training epoch. Clamped to [1/3, 1].')
 parser.add_argument('--sample-by-ct', action='store_true',
-                    help='Train only: each positive CT is one item; load once and crop a full batch. '
-                         'Val/eval/test keep BboxReader.')
+                    help='Train only: each positive CT is one item; load once and crop a full batch. Val/eval/test keep BboxReader.')
 parser.add_argument('--organized-npz', action='store_true',
                     help='Use luna25_organized cropped-original-resolution NPZs with CT-level loading.')
 parser.add_argument('--data-root', default=None, type=str,
@@ -290,17 +289,22 @@ parser.add_argument('--window-min', default=-1200.0, type=float,
                     help='HU window lower bound for organized NPZ input')
 parser.add_argument('--window-max', default=600.0, type=float,
                     help='HU window upper bound for organized NPZ input')
+parser.add_argument('--gt-boost', action='store_true',
+                    help='Enable competition GT oversampling (train only). '
+                         'Boost lesions and change series selection rules.')
+parser.add_argument('--gt-boost-factor', default=5.0, type=float,
+                    help='Per-category GT boost weight factor (default: 5).')
+parser.add_argument('--focal-loss-gamma', default=net_config.get('focal_loss_gamma', 2.0), type=float,
+                    help='Focal loss focusing parameter gamma (default: 2.0).')
+parser.add_argument('--focal-loss-weight', default=net_config.get('focal_loss_weight', 1.0), type=float,
+                    help='Extra focal loss weight lambda; total += lambda * (rpn_focal + rcnn_focal). 0 disables.')
 parser.add_argument('--local-rank', '--local_rank', default=-1, type=int,
-                    help='local rank passed by torchrun/torch.distributed.launch')
+                    help='local rank passed by torch/torch.distributed.launch')
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend for DDP training')
 parser.add_argument('--use-aspp', action='store_true', help='Enable ASPP3D in the RPN head.')
 parser.add_argument('--training-log', default=None, type=str,
                     help='JSONL training log path. Default: <out-dir>/training.log')
-parser.add_argument('--focal-loss-gamma', default=net_config.get('focal_loss_gamma', 2.0), type=float,
-                    help='Focal loss focusing parameter gamma (default: 2.0).')
-parser.add_argument('--focal-loss-weight', default=net_config.get('focal_loss_weight', 1.0), type=float,
-                    help='Extra focal loss weight lambda; total += lambda * (rpn_focal + rcnn_focal). 0 disables.')
 
 
 class NullWriter:
@@ -366,7 +370,7 @@ def get_optimizer_lr(optimizer):
 
 
 def compute_train_log_indices(num_batches, max_logs=10):
-    """Up to ``max_logs`` step indices per epoch; always includes 0 when possible."""
+    """Up to `max_logs` step indices per epoch; always includes 0 when possible."""
     num_batches = int(num_batches)
     if num_batches <= 0:
         return set()
@@ -508,7 +512,7 @@ def build_split_dataset(dataset_name, split, hard_fp_csv=None, hard_fn_csv=None,
         except (FileNotFoundError, ValueError) as exc:
             if dataset_name != 'all':
                 raise
-            print("[%s] Skip %s split: %s" % (dataset_cfg['dataset'], split, exc))
+            print('[%s] Skip %s split: %s' % (dataset_cfg['dataset'], split, exc))
     if not datasets:
         raise ValueError("No usable datasets for %s split in dataset=%s" % (split, dataset_name))
     if len(datasets) == 1:
@@ -554,9 +558,9 @@ def main():
             raise ValueError('--target-spacing-zyx must be comma-separated floats') from exc
         if len(target_spacing_zyx) != 3:
             raise ValueError('--target-spacing-zyx must contain exactly three values')
-        # Keep logging and downstream metadata aligned with the active split files.
-        args.train_set = [args.train_list]
-        args.val_set = [args.val_list]
+    # Keep logging and downstream metadata aligned with the active split files.
+    args.train_set = [args.train_list]
+    args.val_set = [args.val_list]
     init_distributed_mode(args)
     if args.gpu and not args.distributed:
         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -587,7 +591,7 @@ def main():
     epoch_save = args.epoch_save
     epoch_rcnn = args.epoch_rcnn
     batch_size = args.batch_size
-    lr_schdule = train_config['lr_schedule']
+    lr_schedule = train_config['lr_schedule']
     if organized_requested:
         train_dataset, val_dataset = build_organized_npz_datasets(
             data_root=args.data_root,
@@ -600,6 +604,8 @@ def main():
             window_min=args.window_min,
             window_max=args.window_max,
             train_neg_pos_ratio=args.train_neg_pos_ratio,
+            gt_boost=args.gt_boost,
+            gt_boost_factor=args.gt_boost_factor,
         )
     elif args.sample_by_ct:
         train_dataset = build_ct_batch_datasets(
@@ -648,7 +654,7 @@ def main():
             collate_fn=ct_batch_collate,
         )
     elif args.sample_by_ct:
-        # Each train item already contains ``batch_size`` patches from one main CT.
+        # Each train item already contains `batch_size` patches from one main CT.
         train_loader = DataLoader(train_dataset, batch_size=1, shuffle=(train_sampler is None),
                                   sampler=train_sampler,
                                   num_workers=args.num_workers, pin_memory=pin_memory,
@@ -667,7 +673,7 @@ def main():
                                 num_workers=args.num_workers, pin_memory=pin_memory,
                                 collate_fn=train_collate)
 
-    # Initilize network
+    # Initialize network
     net = getattr(this_module, net)(net_config, use_aspp=args.use_aspp)
     net = net.cuda()
 
@@ -691,7 +697,6 @@ def main():
             weights_only=False,
         )
         checkpoint_state = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
-        checkpoint_state = strip_module_prefix(checkpoint_state)
         if args.resume:
             start_epoch = checkpoint.get('epoch', 0)
             best_loss = checkpoint.get('best_loss', np.inf)
@@ -706,7 +711,7 @@ def main():
         try:
             net.load_state_dict(state)
         except:
-            print('Load something failed!')
+            print('load something failed!')
             traceback.print_exc()
 
     if args.distributed:
@@ -752,7 +757,7 @@ def main():
     print('[Model configuration]')
     pprint.pprint(net_config)
 
-    print('[start_epoch %d, out_dir %s]' % (start_epoch, out_dir))
+    print('[Start_epoch %d, out_dir %s]' % (start_epoch, out_dir))
     print('[length of train loader %d, length of valid loader %d]' % (len(train_loader), len(val_loader)))
 
     training_log_path = args.training_log or os.path.join(out_dir, 'training.log')
@@ -773,7 +778,6 @@ def main():
         val_writer = SummaryWriter(os.path.join(tb_out_dir, 'val'))
     else:
         writer = train_writer = val_writer = NullWriter()
-    # writer.add_graph(net, (torch.zeros((16, 1, 128, 128, 128)).cuda(), [[]], [[]], [[]], [torch.zeros((16, 128, 128, 128))]), verbose=False)
 
     for i in tqdm(range(start_epoch, epochs + 1), desc='Total', disable=not is_main_process(args)):
         if train_sampler is not None:
@@ -782,7 +786,7 @@ def main():
             organized_epoch_dataset.set_epoch(i)
         # learning rate schedule
         if isinstance(optimizer, torch.optim.SGD):
-            base_lr = lr_schdule(i, init_lr=init_lr, total=epochs)
+            base_lr = lr_schedule(i, init_lr=init_lr, total=epochs)
 
             rcnn_warmup_epochs = 10
             rcnn_lr_scale = 0.1
@@ -804,7 +808,6 @@ def main():
         else:
             base_lr = optimizer.param_groups[0]['lr']
             rcnn_lr = optimizer.param_groups[1]['lr']
-
         lr = base_lr
 
         model = unwrap_model(net)
@@ -825,7 +828,7 @@ def main():
             float(net_config.get('focal_loss_gamma', 2.0)),
             float(net_config.get('focal_loss_weight', 1.0)),
         ))
-        print('[epoch %d, base_lr %.6f, rcnn_lr %.6f, use_rcnn: %r]' % (i, base_lr, rcnn_lr, model.use_rcnn))
+        print('[Epoch %d, base_lr %.6f, rcnn_lr %.6f, use_rcnn: %r]' % (i, base_lr, rcnn_lr, model.use_rcnn))
         train(net, train_loader, optimizer, i, train_writer, args,
               json_logger=json_logger, step_state=step_state, data_source=train_data_source)
         val_summary = validate(net, val_loader, i, val_writer, args,
@@ -854,8 +857,6 @@ def main():
         if not is_main_process(args):
             if args.distributed:
                 dist.barrier()
-            if should_stop:
-                break
             continue
 
         state_dict = unwrap_model(net).state_dict()
@@ -894,6 +895,7 @@ def main():
             lr=get_optimizer_lr(optimizer),
             checkpoint=final_ckpt_path,
         )
+
         if is_best:
             best_ckpt_path = os.path.join(model_out_dir, 'best.ckpt')
             torch.save(checkpoint, best_ckpt_path)
@@ -938,6 +940,7 @@ def train(net, train_loader, optimizer, epoch, writer, args,
     s = time.time()
     rpn_cls_loss, rpn_reg_loss = [], []
     rcnn_cls_loss, rcnn_reg_loss = [], []
+    rpn_focal_loss, rcnn_focal_loss = [], []
     total_loss = []
     rpn_stats = []
     rcnn_stats = []
@@ -960,6 +963,8 @@ def train(net, train_loader, optimizer, epoch, writer, args,
         rpn_reg_loss.append(model.rpn_reg_loss.cpu().data.item())
         rcnn_cls_loss.append(model.rcnn_cls_loss.cpu().data.item())
         rcnn_reg_loss.append(model.rcnn_reg_loss.cpu().data.item())
+        rpn_focal_loss.append(getattr(model, 'rpn_focal_loss', torch.zeros(1)).cpu().data.item())
+        rcnn_focal_loss.append(getattr(model, 'rcnn_focal_loss', torch.zeros(1)).cpu().data.item())
 
         step_loss = loss.cpu().data.item()
         total_loss.append(step_loss)
@@ -990,9 +995,10 @@ def train(net, train_loader, optimizer, epoch, writer, args,
     rpn_stats = np.asarray(rpn_stats, np.float32)
 
     print('Train Epoch %d, iter %d, total time %f, loss %f' % (epoch, j, time.time() - s, np.average(total_loss)))
-    print('rpn_cls %f, rpn_reg %f, rcnn_cls %f, rcnn_reg %f' % \
+    print('rpn_cls %f, rpn_reg %f, rcnn_cls %f, rcnn_reg %f, rpn_focal %f, rcnn_focal %f' % \
           (np.average(rpn_cls_loss), np.average(rpn_reg_loss),
-           np.average(rcnn_cls_loss), np.average(rcnn_reg_loss)
+           np.average(rcnn_cls_loss), np.average(rcnn_reg_loss),
+           np.average(rpn_focal_loss), np.average(rcnn_focal_loss)
            ))
     print('rpn_stats: tpr %f, tnr %f, total pos %d, total neg %d, reg %.4f, %.4f, %.4f, %.4f, %.4f, %.4f' % (
         100.0 * np.sum(rpn_stats[:, 0]) / np.sum(rpn_stats[:, 1]),
@@ -1013,6 +1019,8 @@ def train(net, train_loader, optimizer, epoch, writer, args,
     writer.add_scalar('rpn_reg', np.average(rpn_reg_loss), epoch)
     writer.add_scalar('rcnn_cls', np.average(rcnn_cls_loss), epoch)
     writer.add_scalar('rcnn_reg', np.average(rcnn_reg_loss), epoch)
+    writer.add_scalar('rpn_focal', np.average(rpn_focal_loss), epoch)
+    writer.add_scalar('rcnn_focal', np.average(rcnn_focal_loss), epoch)
 
     writer.add_scalar('rpn_reg_z', np.mean(rpn_stats[:, 4]), epoch)
     writer.add_scalar('rpn_reg_y', np.mean(rpn_stats[:, 5]), epoch)
@@ -1044,12 +1052,14 @@ def train(net, train_loader, optimizer, epoch, writer, args,
 
     torch.cuda.empty_cache()
 
+
 def validate(net, val_loader, epoch, writer, args,
              json_logger=None, step_state=None, data_source=None, optimizer=None):
     model = unwrap_model(net)
     model.set_mode('valid')
     rpn_cls_loss, rpn_reg_loss = [], []
     rcnn_cls_loss, rcnn_reg_loss = [], []
+    rpn_focal_loss, rcnn_focal_loss = [], []
     total_loss = []
     rpn_stats = []
     rcnn_stats = []
@@ -1058,7 +1068,7 @@ def validate(net, val_loader, epoch, writer, args,
 
     s = time.time()
     for j, (input, truth_box, truth_label) in tqdm(enumerate(val_loader), total=len(val_loader), desc='Val %d' % epoch,
-                                                   disable=not is_main_process(args)):
+                                                  disable=not is_main_process(args)):
         with torch.no_grad():
             input = Variable(input).cuda()
 
@@ -1079,22 +1089,25 @@ def validate(net, val_loader, epoch, writer, args,
                     truth_box[b],
                 )
 
-        rpn_cls_loss.append(model.rpn_cls_loss.cpu().data.item())
-        rpn_reg_loss.append(model.rpn_reg_loss.cpu().data.item())
-        rcnn_cls_loss.append(model.rcnn_cls_loss.cpu().data.item())
-        rcnn_reg_loss.append(model.rcnn_reg_loss.cpu().data.item())
+            rpn_cls_loss.append(model.rpn_cls_loss.cpu().data.item())
+            rpn_reg_loss.append(model.rpn_reg_loss.cpu().data.item())
+            rcnn_cls_loss.append(model.rcnn_cls_loss.cpu().data.item())
+            rcnn_reg_loss.append(model.rcnn_reg_loss.cpu().data.item())
+            rpn_focal_loss.append(getattr(model, 'rpn_focal_loss', torch.zeros(1)).cpu().data.item())
+            rcnn_focal_loss.append(getattr(model, 'rcnn_focal_loss', torch.zeros(1)).cpu().data.item())
 
-        total_loss.append(loss.cpu().data.item())
-        rpn_stats.append(to_numpy_safe(rpn_stat))
-        rcnn_stats.append(to_numpy_safe(rcnn_stat))
-        del input, truth_box, truth_label, loss, rpn_stat, rcnn_stat, raw_proposals, detections
-        clear_model_batch_state(model)
+            total_loss.append(loss.cpu().data.item())
+            rpn_stats.append(to_numpy_safe(rpn_stat))
+            rcnn_stats.append(to_numpy_safe(rcnn_stat))
+            del input, truth_box, truth_label, loss, rpn_stat, rcnn_stat, raw_proposals, detections
+            clear_model_batch_state(model)
 
     rpn_stats = np.asarray(rpn_stats, np.float32)
     print('Val Epoch %d, iter %d, total time %f, loss %f' % (epoch, j, time.time() - s, np.average(total_loss)))
-    print('rpn_cls %f, rpn_reg %f, rcnn_cls %f, rcnn_reg %f' % \
+    print('rpn_cls %f, rpn_reg %f, rcnn_cls %f, rcnn_reg %f, rpn_focal %f, rcnn_focal %f' % \
           (np.average(rpn_cls_loss), np.average(rpn_reg_loss),
-           np.average(rcnn_cls_loss), np.average(rcnn_reg_loss)
+           np.average(rcnn_cls_loss), np.average(rcnn_reg_loss),
+           np.average(rpn_focal_loss), np.average(rcnn_focal_loss)
            ))
     print('rpn_stats: tpr %f, tnr %f, total pos %d, total neg %d, reg %.4f, %.4f, %.4f, %.4f, %.4f, %.4f' % (
         100.0 * np.sum(rpn_stats[:, 0]) / np.sum(rpn_stats[:, 1]),
@@ -1107,6 +1120,7 @@ def validate(net, val_loader, epoch, writer, args,
         np.mean(rpn_stats[:, 7]),
         np.mean(rpn_stats[:, 8]),
         np.mean(rpn_stats[:, 9])))
+
     rpn_detection_meter = distributed_merge_detection_meter(rpn_detection_meter, args)
     detection_meter = distributed_merge_detection_meter(detection_meter, args)
     rpn_det_summary = summarize_detection_meter(rpn_detection_meter)
@@ -1159,6 +1173,8 @@ def validate(net, val_loader, epoch, writer, args,
     writer.add_scalar('rpn_reg', np.average(rpn_reg_loss), epoch)
     writer.add_scalar('rcnn_cls', np.average(rcnn_cls_loss), epoch)
     writer.add_scalar('rcnn_reg', np.average(rcnn_reg_loss), epoch)
+    writer.add_scalar('rpn_focal', np.average(rpn_focal_loss), epoch)
+    writer.add_scalar('rcnn_focal', np.average(rcnn_focal_loss), epoch)
 
     writer.add_scalar('rpn_reg_z', np.mean(rpn_stats[:, 4]), epoch)
     writer.add_scalar('rpn_reg_y', np.mean(rpn_stats[:, 5]), epoch)
@@ -1211,7 +1227,7 @@ def validate(net, val_loader, epoch, writer, args,
 
 
 def print_confusion_matrix(confusion_matrix):
-    line_new = '{:>4}  ' * (len(config['roi_names']) + 2)
+    line_new = '{:>4}' * (len(config['roi_names']) + 2)
     print(line_new.format('gt/p', *list(range(len(config['roi_names']) + 1))))
 
     for i in range(len(config['roi_names']) + 1):
@@ -1220,14 +1236,3 @@ def print_confusion_matrix(confusion_matrix):
 
 if __name__ == '__main__':
     main()
-
-'''
-直接训练：
-    python train_new.py --dataset histopathology --epochs 10 --out-dir output
-
-恢复训练：
-默认从输出目录的 model/final.ckpt 恢复：
-  python train_new.py --dataset histopathology --resume --out-dir train_output
-指定某个 checkpoint 恢复：
-  python train_new.py --dataset histopathology --resume --ckpt train_output/model/final.ckpt
-'''

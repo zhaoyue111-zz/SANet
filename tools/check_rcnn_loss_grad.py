@@ -25,8 +25,8 @@ def main():
     labels = torch.zeros(num_samples, dtype=torch.long, device=device)
     targets = torch.zeros(0, 6, device=device)
 
-    cls_loss, reg_loss, _ = rcnn_loss(logits, deltas, labels, targets)
-    loss = cls_loss + reg_loss
+    cls_loss, reg_loss, focal_loss, _ = rcnn_loss(logits, deltas, labels, targets)
+    loss = cls_loss + reg_loss + focal_loss
     loss.backward()
 
     if logits.grad is None:
@@ -37,7 +37,10 @@ def main():
         raise RuntimeError("expected zero deltas.grad for all-background labels")
 
     print("ok: all-background RCNN batch keeps a zero gradient path for deltas")
-    print("cls_loss=%.6f reg_loss=%.6f" % (float(cls_loss.detach()), float(reg_loss.detach())))
+    print(
+        "cls_loss=%.6f reg_loss=%.6f focal_loss=%.6f"
+        % (float(cls_loss.detach()), float(reg_loss.detach()), float(focal_loss.detach()))
+    )
 
 
 if __name__ == "__main__":

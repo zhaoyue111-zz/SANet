@@ -111,7 +111,12 @@ net_config = {
     'rcnn_test_nms_pre_score_threshold': 0.0,
     'rcnn_test_nms_overlap_threshold': 0.1,
 
-    'box_reg_weight': [1., 1., 1., 1., 1., 1.]  # bbox 回归各维度权重，顺序通常是 z, y, x, d, h, w
+    'box_reg_weight': [1., 1., 1., 1., 1., 1.],  # bbox 回归各维度权重，顺序通常是 z, y, x, d, h, w
+
+    # Extra focal losses (added on top of existing RPN BCE+OHEM / RCNN CE).
+    # total += focal_loss_weight * (rpn_focal + rcnn_focal)
+    'focal_loss_gamma': 2.0,
+    'focal_loss_weight': 1.0,
 }
 
 
