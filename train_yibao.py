@@ -30,7 +30,7 @@ from config import (
     dataset_configs, default_out_dir,
 )
 import pprint
-from torch.utils.data import DataLoader, ConcatDataset, Subset
+from torch.utils.data import DataLoader, ConcatDataset, Subset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 from torch.autograd import Variable
 import torch
@@ -349,6 +349,24 @@ def is_main_process(args):
     return getattr(args, 'rank', 0) == 0
 
 
+class RankStridedSampler(Sampler):
+    """DDP eval sampler without DistributedSampler padding/duplication."""
+
+    def __init__(self, dataset, rank, world_size):
+        self.dataset = dataset
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.world_size))
+
+    def __len__(self):
+        n = len(self.dataset)
+        if self.rank >= n:
+            return 0
+        return (n - 1 - self.rank) // self.world_size + 1
+
+
 def unwrap_model(net):
     return net.module if isinstance(net, DistributedDataParallel) else net
 
@@ -638,7 +656,8 @@ def main():
     pin_memory = torch.cuda.is_available()
     train_sampler = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.rank, shuffle=True) \
         if args.distributed else None
-    val_sampler = DistributedSampler(val_dataset, num_replicas=args.world_size, rank=args.rank, shuffle=False) \
+    # Val must not pad/duplicate samples: DistributedSampler would inflate FROC.
+    val_sampler = RankStridedSampler(val_dataset, args.rank, args.world_size) \
         if args.distributed else None
     if organized_requested:
         # Both splits are CT-level datasets. Each item loads one CT once and
@@ -857,6 +876,8 @@ def main():
         if not is_main_process(args):
             if args.distributed:
                 dist.barrier()
+            if should_stop:
+                break
             continue
 
         state_dict = unwrap_model(net).state_dict()
@@ -1067,6 +1088,7 @@ def validate(net, val_loader, epoch, writer, args,
     detection_meter = init_detection_meter()
 
     s = time.time()
+    j = -1
     for j, (input, truth_box, truth_label) in tqdm(enumerate(val_loader), total=len(val_loader), desc='Val %d' % epoch,
                                                   disable=not is_main_process(args)):
         with torch.no_grad():
@@ -1102,24 +1124,32 @@ def validate(net, val_loader, epoch, writer, args,
             del input, truth_box, truth_label, loss, rpn_stat, rcnn_stat, raw_proposals, detections
             clear_model_batch_state(model)
 
-    rpn_stats = np.asarray(rpn_stats, np.float32)
-    print('Val Epoch %d, iter %d, total time %f, loss %f' % (epoch, j, time.time() - s, np.average(total_loss)))
+    rpn_stats = np.asarray(rpn_stats, np.float32) if rpn_stats else np.zeros((0, 10), dtype=np.float32)
+    avg_total_loss = float(np.average(total_loss)) if total_loss else 0.0
+    avg_rpn_cls = float(np.average(rpn_cls_loss)) if rpn_cls_loss else 0.0
+    avg_rpn_reg = float(np.average(rpn_reg_loss)) if rpn_reg_loss else 0.0
+    avg_rcnn_cls = float(np.average(rcnn_cls_loss)) if rcnn_cls_loss else 0.0
+    avg_rcnn_reg = float(np.average(rcnn_reg_loss)) if rcnn_reg_loss else 0.0
+    avg_rpn_focal = float(np.average(rpn_focal_loss)) if rpn_focal_loss else 0.0
+    avg_rcnn_focal = float(np.average(rcnn_focal_loss)) if rcnn_focal_loss else 0.0
+    print('Val Epoch %d, iter %d, total time %f, loss %f' % (epoch, j, time.time() - s, avg_total_loss))
     print('rpn_cls %f, rpn_reg %f, rcnn_cls %f, rcnn_reg %f, rpn_focal %f, rcnn_focal %f' % \
-          (np.average(rpn_cls_loss), np.average(rpn_reg_loss),
-           np.average(rcnn_cls_loss), np.average(rcnn_reg_loss),
-           np.average(rpn_focal_loss), np.average(rcnn_focal_loss)
+          (avg_rpn_cls, avg_rpn_reg, avg_rcnn_cls, avg_rcnn_reg, avg_rpn_focal, avg_rcnn_focal
            ))
-    print('rpn_stats: tpr %f, tnr %f, total pos %d, total neg %d, reg %.4f, %.4f, %.4f, %.4f, %.4f, %.4f' % (
-        100.0 * np.sum(rpn_stats[:, 0]) / np.sum(rpn_stats[:, 1]),
-        100.0 * np.sum(rpn_stats[:, 2]) / np.sum(rpn_stats[:, 3]),
-        np.sum(rpn_stats[:, 1]),
-        np.sum(rpn_stats[:, 3]),
-        np.mean(rpn_stats[:, 4]),
-        np.mean(rpn_stats[:, 5]),
-        np.mean(rpn_stats[:, 6]),
-        np.mean(rpn_stats[:, 7]),
-        np.mean(rpn_stats[:, 8]),
-        np.mean(rpn_stats[:, 9])))
+    if len(rpn_stats):
+        print('rpn_stats: tpr %f, tnr %f, total pos %d, total neg %d, reg %.4f, %.4f, %.4f, %.4f, %.4f, %.4f' % (
+            100.0 * np.sum(rpn_stats[:, 0]) / max(np.sum(rpn_stats[:, 1]), 1),
+            100.0 * np.sum(rpn_stats[:, 2]) / max(np.sum(rpn_stats[:, 3]), 1),
+            np.sum(rpn_stats[:, 1]),
+            np.sum(rpn_stats[:, 3]),
+            np.mean(rpn_stats[:, 4]),
+            np.mean(rpn_stats[:, 5]),
+            np.mean(rpn_stats[:, 6]),
+            np.mean(rpn_stats[:, 7]),
+            np.mean(rpn_stats[:, 8]),
+            np.mean(rpn_stats[:, 9])))
+    else:
+        print('rpn_stats: empty (this rank has no val batches)')
 
     rpn_detection_meter = distributed_merge_detection_meter(rpn_detection_meter, args)
     detection_meter = distributed_merge_detection_meter(detection_meter, args)
@@ -1167,21 +1197,22 @@ def validate(net, val_loader, epoch, writer, args,
     ))
 
     # Write to tensorboard
-    val_loss = np.average(total_loss)
+    val_loss = avg_total_loss
     writer.add_scalar('loss', val_loss, epoch)
-    writer.add_scalar('rpn_cls', np.average(rpn_cls_loss), epoch)
-    writer.add_scalar('rpn_reg', np.average(rpn_reg_loss), epoch)
-    writer.add_scalar('rcnn_cls', np.average(rcnn_cls_loss), epoch)
-    writer.add_scalar('rcnn_reg', np.average(rcnn_reg_loss), epoch)
-    writer.add_scalar('rpn_focal', np.average(rpn_focal_loss), epoch)
-    writer.add_scalar('rcnn_focal', np.average(rcnn_focal_loss), epoch)
+    writer.add_scalar('rpn_cls', avg_rpn_cls, epoch)
+    writer.add_scalar('rpn_reg', avg_rpn_reg, epoch)
+    writer.add_scalar('rcnn_cls', avg_rcnn_cls, epoch)
+    writer.add_scalar('rcnn_reg', avg_rcnn_reg, epoch)
+    writer.add_scalar('rpn_focal', avg_rpn_focal, epoch)
+    writer.add_scalar('rcnn_focal', avg_rcnn_focal, epoch)
 
-    writer.add_scalar('rpn_reg_z', np.mean(rpn_stats[:, 4]), epoch)
-    writer.add_scalar('rpn_reg_y', np.mean(rpn_stats[:, 5]), epoch)
-    writer.add_scalar('rpn_reg_x', np.mean(rpn_stats[:, 6]), epoch)
-    writer.add_scalar('rpn_reg_d', np.mean(rpn_stats[:, 7]), epoch)
-    writer.add_scalar('rpn_reg_h', np.mean(rpn_stats[:, 8]), epoch)
-    writer.add_scalar('rpn_reg_w', np.mean(rpn_stats[:, 9]), epoch)
+    if len(rpn_stats):
+        writer.add_scalar('rpn_reg_z', np.mean(rpn_stats[:, 4]), epoch)
+        writer.add_scalar('rpn_reg_y', np.mean(rpn_stats[:, 5]), epoch)
+        writer.add_scalar('rpn_reg_x', np.mean(rpn_stats[:, 6]), epoch)
+        writer.add_scalar('rpn_reg_d', np.mean(rpn_stats[:, 7]), epoch)
+        writer.add_scalar('rpn_reg_h', np.mean(rpn_stats[:, 8]), epoch)
+        writer.add_scalar('rpn_reg_w', np.mean(rpn_stats[:, 9]), epoch)
     writer.add_scalar('det/rpn_candidates_per_scan', rpn_det_summary['candidates_per_scan'], epoch)
     writer.add_scalar('det/rpn_froc_mean', rpn_det_summary['froc_mean'], epoch)
     writer.add_scalar('det/rpn_gt_detected_any_score', rpn_det_summary.get('gt_detected_any_score', 0.0), epoch)
